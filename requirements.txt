@@ -1,0 +1,19 @@
+torch>=2.3.0
+transformers>=4.44.0
+datasets>=2.19.0
+accelerate>=0.33.0
+peft>=0.13.0
+evaluate>=0.4.2
+numpy>=1.26.0
+pandas>=2.1.0
+scikit-learn>=1.4.0
+tqdm>=4.66.0
+rich>=13.7.0
+pyyaml>=6.0.1
+sentencepiece>=0.2.0
+safetensors>=0.4.3
+# bitsandbytes provides 4-bit loading on CUDA GPUs; macOS without CUDA likely unsupported
+# bitsandbytes>=0.43.1
+# Optional experiment tracking
+# wandb>=0.17.0
+
