@@ -563,7 +563,13 @@ class LlamaMoEAttention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # Compatible with different transformers versions
+            if hasattr(past_key_value, 'get_seq_length'):
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
+            elif hasattr(past_key_value, 'get_usable_length'):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += 0
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -669,7 +675,13 @@ class LlamaMoEFlashAttention2(LlamaMoEAttention):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # Compatible with different transformers versions
+            if hasattr(past_key_value, 'get_seq_length'):
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
+            elif hasattr(past_key_value, 'get_usable_length'):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += 0
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -866,7 +878,13 @@ class LlamaMoESdpaAttention(LlamaMoEAttention):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # Compatible with different transformers versions
+            if hasattr(past_key_value, 'get_seq_length'):
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
+            elif hasattr(past_key_value, 'get_usable_length'):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += 0
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -1181,7 +1199,13 @@ class LlamaMoEModel(LlamaMoEPreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+            # Compatible with different transformers versions
+            if hasattr(past_key_values, 'get_seq_length'):
+                past_key_values_length = past_key_values.get_seq_length()
+            elif hasattr(past_key_values, 'get_usable_length'):
+                past_key_values_length = past_key_values.get_usable_length(seq_length)
+            else:
+                past_key_values_length = 0
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device

@@ -9,16 +9,17 @@ from transformers import (
     AutoTokenizer, 
     Trainer, 
     TrainingArguments, 
-    HfArgumentParser
+    HfArgumentParser,
+    BitsAndBytesConfig
 )
 from datasets import load_dataset
 import numpy as np
 import wandb
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from peft.tuners.lora import LoraLayer
 
-# 添加 src 路径以导入模型
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# 尝试导入 MoE 模型
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizerFast
 try:
     from src.configuration_llama_moe import LlamaMoEConfig
@@ -30,7 +31,6 @@ except ImportError:
 # 注册自定义模型配置和模型类，确保 AutoConfig 能识别 "llama_moe"
 AutoConfig.register("llama_moe", LlamaMoEConfig)
 AutoModelForCausalLM.register(LlamaMoEConfig, LlamaMoEForCausalLM)
-# 注册 Tokenizer
 AutoTokenizer.register(LlamaMoEConfig, fast_tokenizer_class=PreTrainedTokenizerFast)
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="models/Llama-3.1-8B-MoE-Upcycled")
     use_flash_attn: bool = field(default=True)
+    use_lora: bool = field(default=True, metadata={"help": "Use LoRA for parameter-efficient training"})
+    use_qlora: bool = field(default=False, metadata={"help": "Use QLoRA (4-bit + LoRA) training"})
+    lora_r: int = field(default=64)
+    lora_alpha: int = field(default=16)
+    lora_dropout: float = field(default=0.05)
+    num_experts_to_train: Optional[int] = field(default=None, metadata={"help": "Number of experts to train (freeze others), e.g., 4 out of 8"})
 
 @dataclass
 class DataArguments:
@@ -102,28 +108,110 @@ def train():
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
-    # 确保 WandB 初始化
     if "wandb" in training_args.report_to:
         if training_args.run_name is None:
             training_args.run_name = f"Llama-MoE-SFT-{os.path.basename(data_args.data_path)}"
-        # 在主进程初始化
         if training_args.local_rank <= 0:
             wandb.init(project="Llama-MoE-SFT", name=training_args.run_name)
 
-    # Load Model
     logger.info(f"Loading MoE model from {model_args.model_name_or_path}...")
     
     model_kwargs = {
-        "torch_dtype": torch.bfloat16 if training_args.bf16 else torch.float16,
         "trust_remote_code": True,
     }
     if model_args.use_flash_attn:
         model_kwargs["attn_implementation"] = "flash_attention_2"
 
+    if model_args.use_qlora:
+        logger.info("Using QLoRA (4-bit quantization)...")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model_kwargs["quantization_config"] = bnb_config
+        model_kwargs["torch_dtype"] = torch.bfloat16
+    else:
+        model_kwargs["torch_dtype"] = torch.bfloat16 if training_args.bf16 else torch.float16
+
     model = LlamaMoEForCausalLM.from_pretrained(
         model_args.model_name_or_path, 
         **model_kwargs
     )
+    
+    # Freeze experts if specified
+    if model_args.num_experts_to_train is not None:
+        logger.info(f"Freezing experts: training only first {model_args.num_experts_to_train} experts per layer")
+        frozen_params = 0
+        trainable_params = 0
+        
+        # Iterate through all layers
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            for layer_idx, layer in enumerate(model.model.layers):
+                # Check if this layer has MoE experts
+                if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                    experts = layer.mlp.experts
+                    num_experts = len(experts)
+                    
+                    for expert_idx in range(num_experts):
+                        expert = experts[expert_idx]
+                        
+                        if expert_idx >= model_args.num_experts_to_train:
+                            # Freeze this expert
+                            for param in expert.parameters():
+                                param.requires_grad = False
+                                frozen_params += param.numel()
+                        else:
+                            # Count trainable expert params
+                            for param in expert.parameters():
+                                trainable_params += param.numel()
+                    
+                    if layer_idx == 0:
+                        logger.info(f"  Layer {layer_idx}: {num_experts} experts found, training first {model_args.num_experts_to_train}")
+        
+        logger.info(f"  Frozen expert parameters: {frozen_params:,}")
+        logger.info(f"  Trainable expert parameters: {trainable_params:,}")
+        logger.info(f"  Memory saved: ~{frozen_params * 2 / 1e9:.2f} GB (bf16)")
+    
+    # Apply LoRA (with or without quantization)
+    if model_args.use_lora or model_args.use_qlora:
+        if model_args.use_qlora:
+            logger.info("Preparing model for QLoRA training (4-bit + LoRA)...")
+            model = prepare_model_for_kbit_training(model)
+        else:
+            logger.info("Using LoRA training (bf16, no quantization)...")
+        
+        # Define LoRA Config
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM, 
+            inference_mode=False, 
+            r=model_args.lora_r, 
+            lora_alpha=model_args.lora_alpha, 
+            lora_dropout=model_args.lora_dropout,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj", # Attention
+                "gate_proj", "up_proj", "down_proj",    # Experts / MLP
+            ],
+            bias="none",
+        )
+        model = get_peft_model(model, peft_config)
+        
+        # Apply DeepSeek-MoE's mixed precision strategy
+        # Key: Convert gate and norm modules to float32 for numerical stability and trainability
+        logger.info("Applying mixed precision strategy (DeepSeek-MoE style)...")
+        for name, module in model.named_modules():
+            if isinstance(module, LoraLayer):
+                if training_args.bf16:
+                    module = module.to(torch.bfloat16)
+            if 'norm' in name or 'gate' in name:
+                module = module.to(torch.float32)
+            if 'lm_head' in name or 'embed_tokens' in name:
+                if hasattr(module, 'weight'):
+                    if training_args.bf16 and module.weight.dtype == torch.float32:
+                        module = module.to(torch.bfloat16)
+
+        model.print_trainable_parameters()
     
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -166,36 +254,108 @@ def train():
     eval_dataset = dataset_split["test"]
 
     # Data Processing Function (SFT Format)
-    def formatting_func(example):
-        input_text = example.get("question", "")
-        output_text = ""
-        
-        if "responses" in example and isinstance(example["responses"], list) and len(example["responses"]) > 0:
-            first_response = example["responses"][0]
-            if isinstance(first_response, dict) and "response" in first_response:
-                output_text = first_response["response"]
-            else:
-                output_text = str(first_response)
-        elif "reference_answer" in example:
-            output_text = example["reference_answer"]
-            
-        prompt = f"### Instruction:\n{input_text}\n\n### Response:\n{output_text}"
-        return prompt + tokenizer.eos_token
-
     def tokenize_function(examples):
-        texts = [formatting_func(ex) if isinstance(ex, dict) else formatting_func(examples) for ex in (examples if isinstance(examples, list) else [examples])]
+        # Handle batched processing
         if isinstance(examples, dict):
-            texts = []
-            for i in range(len(examples[list(examples.keys())[0]])):
-                ex = {k: examples[k][i] for k in examples}
-                texts.append(formatting_func(ex))
+            # Batched mode: examples is a dict with lists
+            batch_size = len(examples[list(examples.keys())[0]])
+            questions = []
+            responses = []
+            
+            for i in range(batch_size):
+                question = examples["question"][i] if "question" in examples else ""
                 
-        return tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=data_args.max_seq_length,
-        )
+                # Extract response
+                response = ""
+                if "responses" in examples:
+                    resp_data = examples["responses"][i]
+                    if isinstance(resp_data, list) and len(resp_data) > 0:
+                        first_response = resp_data[0]
+                        if isinstance(first_response, dict) and "response" in first_response:
+                            response = first_response["response"]
+                        else:
+                            response = str(first_response)
+                    else:
+                        response = str(resp_data)
+                elif "reference_answer" in examples:
+                    response = examples["reference_answer"][i]
+                
+                questions.append(question)
+                responses.append(response)
+        else:
+            # Single example mode
+            questions = [examples.get("question", "")]
+            response = ""
+            if "responses" in examples and isinstance(examples["responses"], list) and len(examples["responses"]) > 0:
+                first_response = examples["responses"][0]
+                if isinstance(first_response, dict) and "response" in first_response:
+                    response = first_response["response"]
+                else:
+                    response = str(first_response)
+            elif "reference_answer" in examples:
+                response = examples["reference_answer"]
+            responses = [response]
+        
+        # Build prompts and tokenize efficiently
+        all_input_ids = []
+        all_labels = []
+        all_attention_mask = []
+        
+        for question, response in zip(questions, responses):
+            # Tokenize instruction and response separately (more efficient)
+            instruction_text = f"### Instruction:\n{question}\n\n### Response:\n"
+            
+            # Tokenize instruction part (will be masked in labels)
+            instruction_tokens = tokenizer(
+                instruction_text,
+                add_special_tokens=True,
+                truncation=False,
+            )["input_ids"]
+            
+            # Tokenize response part (will be used for loss)
+            response_tokens = tokenizer(
+                response + tokenizer.eos_token,
+                add_special_tokens=False,
+                truncation=False,
+            )["input_ids"]
+            
+            # Smart truncation: ensure we always have response tokens for training
+            # Reserve at least 25% of max_seq_length for response
+            max_instruction_length = int(data_args.max_seq_length * 0.75)
+            min_response_length = data_args.max_seq_length - max_instruction_length
+            
+            # Truncate instruction if too long
+            if len(instruction_tokens) > max_instruction_length:
+                instruction_tokens = instruction_tokens[:max_instruction_length]
+            
+            # Calculate remaining space for response
+            remaining_space = data_args.max_seq_length - len(instruction_tokens)
+            
+            # Truncate response if needed
+            if len(response_tokens) > remaining_space:
+                response_tokens = response_tokens[:remaining_space]
+            
+            # Combine
+            input_ids = instruction_tokens + response_tokens
+            
+            # Create labels: -100 for instruction, actual tokens for response
+            labels = [-100] * len(instruction_tokens) + response_tokens[:]
+            
+            # Pad to max_length
+            padding_length = data_args.max_seq_length - len(input_ids)
+            input_ids = input_ids + [tokenizer.pad_token_id] * padding_length
+            labels = labels + [-100] * padding_length
+            attention_mask = [1] * len(instruction_tokens + response_tokens) + [0] * padding_length
+            
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+            all_attention_mask.append(attention_mask)
+        
+        return {
+            "input_ids": all_input_ids,
+            "attention_mask": all_attention_mask,
+            "labels": all_labels,
+        }
 
     logger.info("Tokenizing train dataset (with progress bar)...")
     train_dataset = train_dataset.map(

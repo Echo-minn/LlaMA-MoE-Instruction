@@ -1,0 +1,73 @@
+# Default SFT Training Configuration
+# Llama-3.1-8B-MoE Fine-tuning on Natural Reasoning Dataset
+
+# Model Configuration
+model:
+  model_name_or_path: "models/Llama-3.1-8B-MoE-Upcycled"
+  use_flash_attn: true
+  use_lora: true
+  use_qlora: false  # Set to true for 4-bit quantization
+  lora_r: 64
+  lora_alpha: 16
+  lora_dropout: 0.05
+  num_experts_to_train: 4  # Train only 4 out of 8 experts (null for all)
+
+# Data Configuration
+data:
+  data_path: "facebook/natural_reasoning"
+  max_seq_length: 1440  # Optimized for 95%+ coverage
+  val_size: 0.05
+
+# Training Configuration
+training:
+  output_dir: "outputs/Llama-MoE-SFT-Reasoning"
+  
+  # Training steps
+  num_train_epochs: 1
+  max_steps: 2000
+  
+  # Batch size & accumulation
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 2  # Effective batch = 4 GPUs × 4 × 2 = 32
+  
+  # Optimization
+  learning_rate: 2.0e-5
+  optim: "adamw_torch"
+  bf16: true
+  
+  # Gradient & stability
+  gradient_checkpointing: false  # Set to true to save memory
+  max_grad_norm: 1.0
+  
+  # Logging & saving
+  logging_steps: 50
+  save_strategy: "steps"
+  save_steps: 500
+  save_total_limit: 2
+  
+  # Evaluation
+  eval_strategy: "steps"
+  eval_steps: 500
+  
+  # Reporting
+  report_to: "wandb"  # Options: wandb, tensorboard, none
+  log_level: "warning"
+  disable_tqdm: false
+
+# DeepSpeed Configuration
+deepspeed:
+  config_file: "distributed-training/zero2.json"
+  
+# Hardware Configuration
+hardware:
+  gpus: "4,5,6,7"  # GPU IDs to use
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+
+# Environment Variables
+environment:
+  OMP_NUM_THREADS: 1
+  TOKENIZERS_PARALLELISM: false
+  TRANSFORMERS_NO_ADVISORY_WARNINGS: 1
+  TRANSFORMERS_VERBOSITY: "warning"
+

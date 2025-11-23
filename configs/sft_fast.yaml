@@ -1,0 +1,63 @@
+# Fast Training Configuration
+# Optimized for speed, suitable for quick experiments
+
+# Model Configuration
+model:
+  model_name_or_path: "models/Llama-3.1-8B-MoE-Upcycled"
+  use_flash_attn: true
+  use_lora: true
+  use_qlora: false
+  lora_r: 32  # Reduced rank for faster training
+  lora_alpha: 16
+  lora_dropout: 0.05
+  num_experts_to_train: 2  # Only train 2 experts for max speed
+
+# Data Configuration
+data:
+  data_path: "facebook/natural_reasoning"
+  max_seq_length: 1024  # Shorter sequences for faster training
+  val_size: 0.05
+
+# Training Configuration
+training:
+  output_dir: "outputs/Llama-MoE-SFT-Fast"
+  
+  num_train_epochs: 1
+  max_steps: 1000  # Fewer steps for quick experiments
+  
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 1  # Less accumulation = faster
+  
+  learning_rate: 3.0e-5  # Slightly higher LR for faster convergence
+  optim: "adamw_torch"
+  bf16: true
+  
+  gradient_checkpointing: false
+  max_grad_norm: 1.0
+  
+  logging_steps: 50
+  save_strategy: "steps"
+  save_steps: 500
+  save_total_limit: 1  # Save space
+  
+  eval_strategy: "steps"
+  eval_steps: 500
+  
+  report_to: "wandb"
+  log_level: "warning"
+  disable_tqdm: false
+
+deepspeed:
+  config_file: "distributed-training/zero2.json"
+  
+hardware:
+  gpus: "4,5,6,7"
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+
+environment:
+  OMP_NUM_THREADS: 1
+  TOKENIZERS_PARALLELISM: false
+  TRANSFORMERS_NO_ADVISORY_WARNINGS: 1
+  TRANSFORMERS_VERBOSITY: "warning"
+
