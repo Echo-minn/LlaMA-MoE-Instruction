@@ -11,12 +11,12 @@ OUTPUT_DIR="outputs/Llama-MoE-SFT-Reasoning"
 
 # 训练参数
 MAX_STEPS=2000
-BATCH_SIZE_PER_GPU=4    # 4卡总 batch size = 16
-GRAD_ACCUM=4            # 累积4步，等效 batch size = 64
+BATCH_SIZE_PER_GPU=16    # 增大 Batch Size 提高利用率
+GRAD_ACCUM=2            # 调整累积步数，保持总 Batch Size = 64 (8*2*4gpus)
 LEARNING_RATE=2e-5
 
 # 启动 DeepSpeed
-deepspeed --num_gpus 4 src/train_sft.py \
+deepspeed --include localhost:5,7 src/train_sft.py \
     --deepspeed distributed-training/zero3.json \
     --model_name_or_path $MODEL_PATH \
     --data_path $DATA_PATH \
@@ -31,7 +31,7 @@ deepspeed --num_gpus 4 src/train_sft.py \
     --report_to wandb \
     --save_strategy "steps" \
     --save_steps 500 \
-    --evaluation_strategy "steps" \
+    --eval_strategy "steps" \
     --eval_steps 500 \
     --save_total_limit 2 \
     --gradient_checkpointing True \

@@ -13,13 +13,25 @@ from transformers import (
 )
 from datasets import load_dataset
 import numpy as np
+import wandb
 
+# 添加 src 路径以导入模型
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# 尝试导入 MoE 模型
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizerFast
 try:
+    from src.configuration_llama_moe import LlamaMoEConfig
     from src.modeling_llama_moe import LlamaMoEForCausalLM
 except ImportError:
+    from configuration_llama_moe import LlamaMoEConfig
     from modeling_llama_moe import LlamaMoEForCausalLM
+
+# 注册自定义模型配置和模型类，确保 AutoConfig 能识别 "llama_moe"
+AutoConfig.register("llama_moe", LlamaMoEConfig)
+AutoModelForCausalLM.register(LlamaMoEConfig, LlamaMoEForCausalLM)
+# 注册 Tokenizer
+AutoTokenizer.register(LlamaMoEConfig, fast_tokenizer_class=PreTrainedTokenizerFast)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +53,7 @@ class DataArguments:
 class TrainingArguments(TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
+    report_to: str = field(default="wandb") # 显式默认 wandb
 
 def compute_metrics(eval_preds):
     """Compute metrics for evaluation."""
@@ -89,6 +102,14 @@ def train():
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
+    # 确保 WandB 初始化
+    if "wandb" in training_args.report_to:
+        if training_args.run_name is None:
+            training_args.run_name = f"Llama-MoE-SFT-{os.path.basename(data_args.data_path)}"
+        # 在主进程初始化
+        if training_args.local_rank <= 0:
+            wandb.init(project="Llama-MoE-SFT", name=training_args.run_name)
+
     # Load Model
     logger.info(f"Loading MoE model from {model_args.model_name_or_path}...")
     
@@ -104,7 +125,6 @@ def train():
         **model_kwargs
     )
     
-    # Enable gradient checkpointing for memory efficiency
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -151,7 +171,6 @@ def train():
         output_text = ""
         
         if "responses" in example and isinstance(example["responses"], list) and len(example["responses"]) > 0:
-            # Use the first response(high quality answer)
             first_response = example["responses"][0]
             if isinstance(first_response, dict) and "response" in first_response:
                 output_text = first_response["response"]
@@ -178,20 +197,22 @@ def train():
             max_length=data_args.max_seq_length,
         )
 
-    logger.info("Tokenizing train dataset...")
+    logger.info("Tokenizing train dataset (with progress bar)...")
     train_dataset = train_dataset.map(
         tokenize_function,
         batched=True,
         remove_columns=train_dataset.column_names,
-        num_proc=8
+        num_proc=8,
+        desc="Tokenizing Train" # 显示进度条
     )
     
-    logger.info("Tokenizing eval dataset...")
+    logger.info("Tokenizing eval dataset (with progress bar)...")
     eval_dataset = eval_dataset.map(
         tokenize_function,
         batched=True,
         remove_columns=eval_dataset.column_names,
-        num_proc=4
+        num_proc=4,
+        desc="Tokenizing Eval" # 显示进度条
     )
 
     logger.info(f"Training samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")

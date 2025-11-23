@@ -96,7 +96,7 @@ class LlamaMoEConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "deepseek"
+    model_type = "llama_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
