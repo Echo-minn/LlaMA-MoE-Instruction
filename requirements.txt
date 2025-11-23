@@ -16,4 +16,5 @@ safetensors>=0.4.3
 # bitsandbytes>=0.43.1
 # Optional experiment tracking
 # wandb>=0.17.0
+# deepspeed>=0.13.0
 

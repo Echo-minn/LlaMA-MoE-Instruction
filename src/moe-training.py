@@ -1,20 +1,26 @@
 import copy
+import json
+import logging
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence
-import logging
-import os
 
+import numpy as np
 import torch
 import torch.distributed
-import transformers
-from transformers import Trainer, BitsAndBytesConfig
-from datasets import load_dataset
 import datasets
-import numpy as np
+import transformers
+from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
 from peft.tuners.lora import LoraLayer
+from transformers import (
+    AutoTokenizer, BitsAndBytesConfig, HfArgumentParser, 
+    PreTrainedTokenizer, Trainer, TrainingArguments, TrainerCallback, utils
+)
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+from modeling_llama_moe import LlamaMoEModel, LlamaMoEForCausalLM
 
 IGNORE_INDEX = -100
 EOT_TOKEN = "<|EOT|>"
@@ -22,12 +28,12 @@ logger = logging.getLogger(__name__)
 
 def build_instruction_prompt(instruction: str):
     return '''
-You are an AI assistant, developed by DeepSeek Company. For politically sensitive questions, security and privacy issues, you will refuse to answer.
+You are an AI assistant, developed in CMU 11667 25 Fall Course. For politically sensitive questions, security and privacy issues, you will refuse to answer.
 ### Instruction:
 {}
 ### Response:
 '''.format(instruction.strip()).lstrip()
-microsoft/Phi-tiny-MoE-instruct
+
 @dataclass
 class ModelArguments:
     trainable : Optional[str] = field(default="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj")
@@ -36,7 +42,7 @@ class ModelArguments:
     lora_alpha : Optional[float] = field(default=32.)
     modules_to_save : Optional[str] = field(default="embed_tokens,lm_head")
     use_lora : Optional[bool] = field(default=False)
-    model_name_or_path: Optional[str] = field(default="deepseek-ai/deepseek-moe-16b")
+    model_name_or_path: Optional[str] = field(default="models/Llama-3.1-8B")
     attn_implementation : Optional[str] = field(default="flash_attention_2")
     double_quant: bool = field(
         default=True,
@@ -54,9 +60,10 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    eval_data_path: Optional[str] = field(default=None, metadata={"help": "Path to the evaluation data."})
 
 @dataclass
-class TrainingArguments(transformers.TrainingArguments):
+class TrainingArguments(TrainingArguments):
     
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
@@ -64,8 +71,12 @@ class TrainingArguments(transformers.TrainingArguments):
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
+    wandb_project: Optional[str] = field(
+        default=None,
+        metadata={"help": "Wandb project name. If None, uses report_to setting."},
+    )
 
-class SavePeftModelCallback(transformers.TrainerCallback):
+class SavePeftModelCallback(TrainerCallback):
     def save_model(self, args, state, kwargs):
         logger.info('Saving PEFT checkpoint...')
         if state.best_model_checkpoint is not None:
@@ -88,6 +99,67 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         touch(os.path.join(args.output_dir, 'completed'))
         self.save_model(args, state, kwargs)
 
+class MoEExpertStatsCallback(TrainerCallback):
+    """Callback to log MoE expert usage statistics during training."""
+    
+    def __init__(self):
+        self.expert_stats = {}
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Log expert statistics if available in model outputs."""
+        if logs is None:
+            return
+        
+        # Try to extract MoE statistics from model if available
+        model = kwargs.get("model")
+        if model is not None:
+            try:
+                # Look for MoE layers and collect statistics
+                expert_usage = self._collect_expert_stats(model)
+                if expert_usage:
+                    logs.update(expert_usage)
+            except Exception as e:
+                # Silently fail if we can't collect stats
+                pass
+    
+    def _collect_expert_stats(self, model):
+        """Collect expert usage statistics from MoE layers."""
+        stats = {}
+        total_experts = 0
+        expert_usage_counts = {}
+        
+        # Traverse model to find MoE layers
+        for name, module in model.named_modules():
+            # Check if this is an MoE layer (has gate and experts)
+            if hasattr(module, 'gate') and hasattr(module, 'experts'):
+                n_experts = len(module.experts)
+                total_experts += n_experts
+                
+                # Try to get recent gate statistics if available
+                if hasattr(module.gate, '_last_expert_indices'):
+                    expert_indices = module.gate._last_expert_indices
+                    if expert_indices is not None:
+                        # Count expert usage
+                        unique, counts = torch.unique(expert_indices, return_counts=True)
+                        for expert_id, count in zip(unique.cpu().numpy(), counts.cpu().numpy()):
+                            expert_usage_counts[int(expert_id)] = expert_usage_counts.get(int(expert_id), 0) + count
+        
+        if total_experts > 0 and expert_usage_counts:
+            # Calculate load balancing metrics
+            usage_values = list(expert_usage_counts.values())
+            if usage_values:
+                mean_usage = np.mean(usage_values)
+                std_usage = np.std(usage_values)
+                cv = std_usage / mean_usage if mean_usage > 0 else 0.0  # Coefficient of variation
+                
+                stats["moe/num_experts"] = total_experts
+                stats["moe/active_experts"] = len(expert_usage_counts)
+                stats["moe/mean_expert_usage"] = mean_usage
+                stats["moe/std_expert_usage"] = std_usage
+                stats["moe/expert_usage_cv"] = cv  # Lower is better (more balanced)
+        
+        return stats
+
 def get_last_checkpoint(checkpoint_dir):
     if os.path.isdir(checkpoint_dir):
         is_completed = os.path.exists(os.path.join(checkpoint_dir, 'completed'))
@@ -102,7 +174,7 @@ def get_last_checkpoint(checkpoint_dir):
         return latest_ckpt_dir
     return None # first training
 
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
+def safe_save_model_for_hf_trainer(trainer: Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
     state_dict = trainer.model.state_dict()
     if trainer.args.should_save:
@@ -110,7 +182,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
-def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+def _tokenize_fn(strings: Sequence[str], tokenizer: PreTrainedTokenizer) -> Dict:
     """Tokenize a list of strings."""
     tokenized_list = [
         tokenizer(
@@ -136,7 +208,7 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
 def preprocess(
     sources: Sequence[str],
     targets: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
+    tokenizer: PreTrainedTokenizer,
 ) -> Dict:
     """Preprocess the data by tokenizing."""
     examples = [s + t for s, t in zip(sources, targets)]
@@ -150,13 +222,15 @@ def preprocess(
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
-    tokenizer: transformers.PreTrainedTokenizer
+    tokenizer: PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = [torch.tensor(x) for x in input_ids]
+        # Ensure pad_token_id is not None
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+            input_ids, batch_first=True, padding_value=pad_token_id
         )
         labels = [torch.tensor(x) for x in labels]
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
@@ -164,26 +238,121 @@ class DataCollatorForSupervisedDataset(object):
         return dict(
             input_ids=input_ids,
             labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            attention_mask=input_ids.ne(pad_token_id),
         )
 
+def _format_messages(msg):
+    """Format messages to text when chat_template is not available."""
+    text_parts = []
+    for m in msg:
+        role = m.get('role', 'user')
+        content = m.get('content', '')
+        if role == 'user':
+            text_parts.append(f"User: {content}")
+        elif role == 'assistant':
+            text_parts.append(f"Assistant: {content}")
+        else:
+            text_parts.append(f"{role.capitalize()}: {content}")
+    return "\n".join(text_parts)
+
 def train_tokenize_function(examples, tokenizer):
-    sources = [
-        build_instruction_prompt(instruction)
-        for instruction in examples['instruction']
-    ]
-    targets = [f"{output}\n{EOT_TOKEN}" for output in examples['output']]
-    data_dict = preprocess(sources, targets, tokenizer)
-    return data_dict
+    """Tokenize function supporting both instruction/output and messages formats."""
+    if 'messages' in examples:
+        # Handle ultrachat_200k format with messages
+        texts = []
+        for msg in examples['messages']:
+            if tokenizer.chat_template:
+                try:
+                    text = tokenizer.apply_chat_template(
+                        msg, tokenize=False, add_generation_prompt=False
+                    )
+                    texts.append(text)
+                except:
+                    texts.append(_format_messages(msg))
+            else:
+                texts.append(_format_messages(msg))
+        sources = [""] * len(texts)
+        targets = texts
+    else:
+        # Original instruction/output format
+        sources = [build_instruction_prompt(inst) for inst in examples['instruction']]
+        targets = [f"{output}\n{EOT_TOKEN}" for output in examples['output']]
+    return preprocess(sources, targets, tokenizer)
+
+def eval_tokenize_function(examples, tokenizer):
+    """Same as train_tokenize_function but for evaluation."""
+    return train_tokenize_function(examples, tokenizer)
+
+def compute_metrics(eval_pred):
+    """Compute perplexity and other metrics for evaluation.
+    
+    Args:
+        eval_pred: A tuple of (predictions, labels) where:
+            - predictions: numpy array of shape (batch_size, seq_len, vocab_size) with logits
+            - labels: numpy array of shape (batch_size, seq_len) with label token ids
+    """
+    predictions, labels = eval_pred
+    
+    # Ensure predictions and labels are numpy arrays
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+    if not isinstance(predictions, np.ndarray):
+        predictions = np.array(predictions)
+    if not isinstance(labels, np.ndarray):
+        labels = np.array(labels)
+    
+    # Shift predictions and labels for next-token prediction
+    # predictions: (batch, seq_len, vocab_size) -> (batch, seq_len-1, vocab_size)
+    # labels: (batch, seq_len) -> (batch, seq_len-1)
+    shift_logits = predictions[..., :-1, :].reshape(-1, predictions.shape[-1])
+    shift_labels = labels[..., 1:].reshape(-1)
+    
+    # Mask out ignored labels (where label == IGNORE_INDEX)
+    mask = shift_labels != IGNORE_INDEX
+    if mask.sum() == 0:
+        # No valid labels to evaluate
+        return {
+            "perplexity": float('inf'),
+            "eval_loss": float('inf'),
+            "accuracy": 0.0,
+        }
+    
+    shift_logits = shift_logits[mask]
+    shift_labels = shift_labels[mask]
+    
+    # Convert to torch for computation
+    shift_logits = torch.from_numpy(shift_logits).float()
+    shift_labels = torch.from_numpy(shift_labels).long()
+    
+    # Compute cross entropy loss
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='mean')
+    loss = loss_fct(shift_logits, shift_labels)
+    perplexity = torch.exp(loss).item()
+    
+    # Compute accuracy
+    pred_ids = torch.argmax(shift_logits, dim=-1)
+    accuracy = (pred_ids == shift_labels).float().mean().item()
+    
+    return {
+        "perplexity": perplexity,
+        "eval_loss": loss.item(),
+        "accuracy": accuracy,
+    }
 
 def build_model(model_args, training_args, checkpoint_dir):
-    if not model_args.use_lora: assert model_args.bits in [16, 32]
-    compute_dtype = (torch.bfloat16 if training_args.bf16 else torch.float16)
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        load_in_4bit=model_args.bits == 4,
-        load_in_8bit=model_args.bits == 8,
-        quantization_config=BitsAndBytesConfig(
+    """Build model with quantization and LoRA if specified."""
+    if not model_args.use_lora:
+        assert model_args.bits in [16, 32], "Full precision training requires bits=16 or 32"
+    
+    compute_dtype = torch.bfloat16 if training_args.bf16 else torch.float16
+    model_kwargs = {
+        "torch_dtype": compute_dtype,
+        "trust_remote_code": True,
+    }
+    
+    # Add quantization config for LoRA with quantization
+    if model_args.use_lora and model_args.bits < 16:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=model_args.bits == 4,
             load_in_8bit=model_args.bits == 8,
             llm_int8_threshold=6.0,
@@ -191,10 +360,13 @@ def build_model(model_args, training_args, checkpoint_dir):
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=model_args.double_quant,
             bnb_4bit_quant_type=model_args.quant_type,
-        ) if model_args.use_lora else None,
-        torch_dtype=compute_dtype,
-        trust_remote_code=True,
-    )
+        )
+    
+    # Add attention implementation if specified
+    if hasattr(model_args, 'attn_implementation') and model_args.attn_implementation:
+        model_kwargs["attn_implementation"] = model_args.attn_implementation
+    
+    model = LlamaMoEForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
 
     if compute_dtype == torch.float16 and model_args.bits == 4:
         if torch.cuda.is_bf16_supported():
@@ -244,26 +416,74 @@ def build_model(model_args, training_args, checkpoint_dir):
                     module = module.to(torch.bfloat16)
     return model
 
+def _load_config_from_json(config_file):
+    """Load config from JSON file and convert to command line args format."""
+    import json
+    with open(config_file, 'r') as f:
+        config_dict = json.load(f)
+    
+    config_args = []
+    for key, value in config_dict.items():
+        if isinstance(value, bool):
+            if value:  # Only add flag if True
+                config_args.append(f'--{key}')
+        elif isinstance(value, list):
+            for item in value:
+                config_args.extend([f'--{key}', str(item)])
+        else:
+            config_args.extend([f'--{key}', str(value)])
+    return config_args
+
 def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    """Main training function."""
+    import argparse
+    
+    # Parse config_file argument first
+    base_parser = argparse.ArgumentParser()
+    base_parser.add_argument('--config_file', type=str, default=None)
+    base_args, remaining_args = base_parser.parse_known_args()
+    
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    
+    # Load config from JSON if provided, merge with command line args
+    if base_args.config_file:
+        config_args = _load_config_from_json(base_args.config_file)
+        all_args = config_args + remaining_args
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses(args=all_args)
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
+    utils.logging.set_verbosity(log_level)
+    utils.logging.enable_default_handler()
+    utils.logging.enable_explicit_format()
+    
+    # Configure wandb project if specified
+    if training_args.wandb_project and training_args.report_to and 'wandb' in training_args.report_to:
+        import os
+        os.environ['WANDB_PROJECT'] = training_args.wandb_project
+    
     if training_args.local_rank == 0:
         logger.info('='*100)
         logger.info(training_args)
+        # Log DeepSpeed configuration if used
+        if hasattr(training_args, 'deepspeed') and training_args.deepspeed:
+            logger.info(f'Using DeepSpeed configuration: {training_args.deepspeed}')
+            logger.info('DeepSpeed ZeRO will handle distributed training (no DDP needed)')
     
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         model_max_length=training_args.model_max_length,
         padding_side="right",
         use_fast=True,
         trust_remote_code=True
     )
+    
+    # Ensure pad_token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     logger.info("PAD Token:", tokenizer.pad_token, tokenizer.pad_token_id)
     logger.info("BOS Token", tokenizer.bos_token, tokenizer.bos_token_id)
@@ -275,13 +495,16 @@ def train():
     resume_from_checkpoint_dir = get_last_checkpoint(training_args.output_dir)
     model = build_model(model_args, training_args, resume_from_checkpoint_dir)
         
-    raw_train_datasets = load_dataset(
-        'parquet',
-        data_files=data_args.data_path,
-        split="train",
-        cache_dir=training_args.cache_dir
-    )
-    if training_args.local_rank > 0: 
+    # Load training dataset
+    if data_args.data_path.endswith('.parquet') or (os.path.exists(data_args.data_path) and not '/' in data_args.data_path.split('/')[-1]):
+        raw_train_datasets = load_dataset('parquet', data_files=data_args.data_path, split="train", cache_dir=training_args.cache_dir)
+    else:
+        raw_dataset = load_dataset(data_args.data_path, cache_dir=training_args.cache_dir)
+        raw_train_datasets = raw_dataset.get('train_sft') or raw_dataset.get('train')
+        if raw_train_datasets is None:
+            raise ValueError(f"Dataset {data_args.data_path} must have 'train_sft' or 'train' split")
+    
+    if training_args.local_rank > 0 and torch.distributed.is_initialized():
         torch.distributed.barrier()
         
     train_dataset = raw_train_datasets.map(
@@ -295,7 +518,7 @@ def train():
         fn_kwargs={ "tokenizer": tokenizer }
     )
 
-    if training_args.local_rank == 0:
+    if training_args.local_rank == 0 and torch.distributed.is_initialized():
         torch.distributed.barrier()
     
     if training_args.local_rank == 0:
@@ -304,14 +527,78 @@ def train():
             logger.info(f"Sample {index} of the training set: {train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
             logger.info(f"Sample {index} of the training set: {tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
 
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    data_module = dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    # Load evaluation dataset if provided
+    eval_dataset = None
+    if data_args.eval_data_path is not None:
+        if training_args.local_rank == 0:
+            logger.info("Loading evaluation dataset from: {}".format(data_args.eval_data_path))
+        
+        # Load evaluation dataset
+        if data_args.eval_data_path.endswith('.parquet') or (os.path.exists(data_args.eval_data_path) and not '/' in data_args.eval_data_path.split('/')[-1]):
+            raw_eval_datasets = load_dataset('parquet', data_files=data_args.eval_data_path, split="train", cache_dir=training_args.cache_dir)
+        else:
+            raw_eval_dataset = load_dataset(data_args.eval_data_path, cache_dir=training_args.cache_dir)
+            raw_eval_datasets = (raw_eval_dataset.get('test_sft') or 
+                                  raw_eval_dataset.get('test') or 
+                                  raw_eval_dataset.get('validation'))
+            if raw_eval_datasets is None:
+                raise ValueError(f"Dataset {data_args.eval_data_path} must have 'test_sft', 'test', or 'validation' split")
+        
+        if training_args.local_rank > 0 and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        
+        eval_dataset = raw_eval_datasets.map(
+            eval_tokenize_function,
+            batched=True,
+            batch_size=3000,
+            num_proc=32,
+            remove_columns=raw_eval_datasets.column_names,
+            load_from_cache_file=True,
+            desc="Running Encoding on Eval",
+            fn_kwargs={"tokenizer": tokenizer}
+        )
+        
+        if training_args.local_rank == 0 and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+            logger.info("Evaluation dataset samples:", len(eval_dataset))
+            for index in random.sample(range(min(len(eval_dataset), 100)), 2):
+                logger.info(f"Eval sample {index}: {tokenizer.decode(list(eval_dataset[index]['input_ids']))}.")
 
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_module = dict(
+        train_dataset=train_dataset, 
+        eval_dataset=eval_dataset, 
+        data_collator=data_collator,
+    )
+
+    trainer = Trainer(
+        model=model, 
+        tokenizer=tokenizer, 
+        args=training_args, 
+        compute_metrics=compute_metrics if eval_dataset is not None else None,
+        **data_module
+    )
+    
+    # Note: When using DeepSpeed ZeRO, DDP is not used, so no need to set static graph
+    # DeepSpeed handles distributed training and gradient checkpointing compatibility automatically
+    
+    # Add callbacks
     if model_args.use_lora:
         trainer.add_callback(SavePeftModelCallback)
-    trainer.train(resume_from_checkpoint = resume_from_checkpoint_dir)
+    trainer.add_callback(MoEExpertStatsCallback())
+    
+    # Train
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint_dir)
     trainer.save_state()
+    
+    # Final evaluation if eval dataset is provided
+    if eval_dataset is not None:
+        logger.info("Running final evaluation...")
+        eval_metrics = trainer.evaluate()
+        logger.info("Final evaluation metrics: {}".format(eval_metrics))
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
+    
     if not model_args.use_lora:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 

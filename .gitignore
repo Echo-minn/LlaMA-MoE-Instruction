@@ -1,3 +1,6 @@
 /outputs
 /tmp
 /wandb
+/models
+
+**/*__pycache__
