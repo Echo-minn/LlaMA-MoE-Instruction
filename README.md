@@ -17,5 +17,5 @@ bash scripts/convert_llama3b_to_moe.sh
 
 ## Train the model
 ```bash
-bash scripts/run_sft_moe.sh
+bash scripts/run_mixed_sft.sh
 ```

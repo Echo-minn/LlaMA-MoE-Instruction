@@ -149,6 +149,67 @@ def load_model(model_path, device="cuda", load_in_4bit=False):
         print(f"   ❌ Failed to load model: {e}")
         return None, None
 
+def manual_generate(model, input_ids, attention_mask, max_new_tokens, temperature, top_p, eos_token_id, pad_token_id):
+    """Manual generation loop when model.generate() is not available"""
+    import torch.nn.functional as F
+    
+    device = input_ids.device
+    generated = input_ids.clone()
+    past_key_values = None
+    
+    for _ in range(max_new_tokens):
+        # Forward pass
+        if past_key_values is not None:
+            outputs = model(
+                input_ids=generated[:, -1:],
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+        else:
+            outputs = model(
+                input_ids=generated,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+        
+        past_key_values = outputs.past_key_values if hasattr(outputs, 'past_key_values') else None
+        logits = outputs.logits[:, -1, :]
+        
+        # Apply temperature
+        logits = logits / temperature
+        
+        # Apply top-p sampling
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = float('-inf')
+        
+        # Sample
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        
+        # Append to generated sequence
+        generated = torch.cat([generated, next_token], dim=1)
+        
+        # Update attention mask
+        attention_mask = torch.cat([
+            attention_mask,
+            torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)
+        ], dim=1)
+        
+        # Check for EOS
+        if next_token.item() == eos_token_id:
+            break
+    
+    return generated
+
 def generate_response(model, tokenizer, prompt, max_new_tokens=256, temperature=0.7, top_p=0.9):
     """Generate response for a given prompt"""
     
@@ -167,7 +228,7 @@ def generate_response(model, tokenizer, prompt, max_new_tokens=256, temperature=
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    # Generate
+    # Try to use model.generate() first
     try:
         with torch.no_grad():
             outputs = model.generate(
@@ -179,25 +240,19 @@ def generate_response(model, tokenizer, prompt, max_new_tokens=256, temperature=
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
-    except AttributeError as e:
-        # Fallback: if model doesn't have generate, get the base model
-        print(f"   ⚠️  Model.generate() failed, trying to access base model...")
-        if hasattr(model, 'base_model'):
-            base_model = model.base_model
-        elif hasattr(model, 'model'):
-            base_model = model.model.model if hasattr(model.model, 'model') else model.model
-        else:
-            base_model = model
-        
+    except (AttributeError, NotImplementedError) as e:
+        # Fallback: manual generation
+        print(f"   ℹ️  Using manual generation (model.generate() not available)")
         with torch.no_grad():
-            outputs = base_model.generate(
-                **inputs,
+            outputs = manual_generate(
+                model,
+                inputs['input_ids'],
+                inputs['attention_mask'],
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
             )
     
     # Decode

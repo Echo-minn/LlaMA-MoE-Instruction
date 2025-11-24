@@ -38,6 +38,7 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
+from transformers.generation.utils import GenerationMixin
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
     add_start_docstrings,
@@ -1294,7 +1295,7 @@ class LlamaMoEModel(LlamaMoEPreTrainedModel):
         )
 
 
-class LlamaMoEForCausalLM(LlamaMoEPreTrainedModel):
+class LlamaMoEForCausalLM(LlamaMoEPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
