@@ -181,8 +181,7 @@ def train():
             model = prepare_model_for_kbit_training(model)
         else:
             logger.info("Using LoRA training (bf16, no quantization)...")
-        
-        # Define LoRA Config
+
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, 
             inference_mode=False, 

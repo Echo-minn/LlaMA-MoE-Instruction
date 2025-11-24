@@ -277,7 +277,6 @@ def train():
         "torch_dtype": torch.bfloat16,
     }
     
-    # Enable Flash Attention 2 for faster training
     if model_args.use_flash_attn:
         model_kwargs["attn_implementation"] = "flash_attention_2"
     

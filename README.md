@@ -9,6 +9,7 @@
 3. Download the model
 ```bash
 bash scripts/get_init_model.sh
+```
 
 4. Convert the model to MoE
 ```bash

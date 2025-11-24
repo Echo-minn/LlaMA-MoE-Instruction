@@ -1,0 +1,14 @@
+Brief intro of the model architecture and the training pipeline
+
+Convert the llama models to MoE format(broadcast FFN to 8 experts), 
+to make the expert specialize in different tasks, 
+we apply QLoRA to finetune the model on mixed dataset(45K samples), 
+which contains 5 different types of data(general instruction, conversation, code, reasoning, creative).
+
+
+Clarify the following questions:
+1. Compare two models: base and instruction-finetuned model(can from the same model family?) different size also fine.
+2. Can we apply different model structure to finetune the models?(comparable in some aspects)
+3. Same in-context learning and instruction-finetuning method but different hyperparameters and configurations?
+4. Evaluation design: accuracy or **benchmark datasets**(but not too complicated)?
+5. How many prompts do we need for in-context learning(zero-shot/few-shot)
