@@ -131,12 +131,13 @@ deepspeed --include localhost:$GPU_IDS \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
-    --num_experts_to_train 8 \
     --num_train_epochs 1 \
     --max_steps $MAX_STEPS \
     --per_device_train_batch_size $BATCH_SIZE \
     --gradient_accumulation_steps $GRAD_ACCUM \
     --learning_rate 2e-5 \
+    --lr_scheduler_type cosine \
+    --warmup_ratio 0.05 \
     --logging_steps 50 \
     --log_level warning \
     --disable_tqdm False \
@@ -152,7 +153,6 @@ deepspeed --include localhost:$GPU_IDS \
     --dataloader_prefetch_factor 4 \
     --dataloader_pin_memory True \
     --dataloader_persistent_workers True \
-    --warmup_steps 100 \
     --ddp_find_unused_parameters False \
     --ddp_bucket_cap_mb 25
 
