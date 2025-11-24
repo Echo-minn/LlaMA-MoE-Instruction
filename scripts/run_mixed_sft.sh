@@ -2,11 +2,27 @@
 
 # Mixed Dataset SFT Training Script
 # Supports validation mode (quick test) and full mode (production)
+# Supports resuming from checkpoint
+#
+# Usage:
+#   bash scripts/run_mixed_sft.sh                          # Start new training
+#   bash scripts/run_mixed_sft.sh --resume                 # Auto-resume from latest checkpoint
+#   bash scripts/run_mixed_sft.sh --resume checkpoint-500  # Resume from specific checkpoint
 
 echo "=========================================="
 echo "Mixed Dataset SFT Training"
 echo "=========================================="
 echo ""
+
+# Parse command line arguments
+RESUME_FROM_CHECKPOINT=""
+if [ "$1" == "--resume" ] || [ "$1" == "-r" ]; then
+    if [ -n "$2" ]; then
+        RESUME_FROM_CHECKPOINT="$2"
+    else
+        RESUME_FROM_CHECKPOINT="auto"
+    fi
+fi
 
 # GPU Configuration
 GPU_IDS="4,5,6,7"  # 🔧 Modify based on available GPUs
@@ -62,6 +78,23 @@ echo "   Output: $OUTPUT_DIR"
 echo "   GPUs: $GPU_IDS"
 echo "   Max steps: $MAX_STEPS"
 echo "   Batch size: $NUM_GPUS × $BATCH_SIZE × $GRAD_ACCUM = $((NUM_GPUS * BATCH_SIZE * GRAD_ACCUM))"
+
+# Check for existing checkpoints if resume requested
+if [ "$RESUME_FROM_CHECKPOINT" == "auto" ]; then
+    # Find latest checkpoint
+    LATEST_CHECKPOINT=$(ls -d $OUTPUT_DIR/checkpoint-* 2>/dev/null | sort -V | tail -1)
+    if [ -n "$LATEST_CHECKPOINT" ]; then
+        RESUME_FROM_CHECKPOINT="$LATEST_CHECKPOINT"
+        echo "   Resume: Yes (auto-detected: $RESUME_FROM_CHECKPOINT)"
+    else
+        echo "   Resume: No checkpoints found, starting from scratch"
+        RESUME_FROM_CHECKPOINT=""
+    fi
+elif [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    echo "   Resume: Yes (from: $RESUME_FROM_CHECKPOINT)"
+else
+    echo "   Resume: No (starting from scratch)"
+fi
 echo ""
 
 # Confirm before starting
@@ -79,6 +112,12 @@ echo ""
 echo "🚀 Starting training..."
 echo ""
 
+# Build resume argument
+RESUME_ARG=""
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    RESUME_ARG="--resume_from_checkpoint $RESUME_FROM_CHECKPOINT"
+fi
+
 # Run training
 deepspeed --include localhost:$GPU_IDS \
     scripts/train_mixed_sft.py \
@@ -86,6 +125,7 @@ deepspeed --include localhost:$GPU_IDS \
     --model_name_or_path $MODEL_PATH \
     --data_config $DATA_CONFIG \
     --output_dir $OUTPUT_DIR \
+    $RESUME_ARG \
     --bf16 True \
     --use_qlora True \
     --lora_r 64 \

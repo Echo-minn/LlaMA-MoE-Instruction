@@ -117,9 +117,9 @@ def load_single_dataset(dataset_config, mode='validation'):
         
         # Load with or without config name
         if config_name:
-            dataset = load_dataset(name, config_name, split=f"{split}[:{num_samples}]", trust_remote_code=True)
+            dataset = load_dataset(name, config_name, split=f"{split}[:{num_samples}]")
         else:
-            dataset = load_dataset(name, split=f"{split}[:{num_samples}]", trust_remote_code=True)
+            dataset = load_dataset(name, split=f"{split}[:{num_samples}]")
         
         # Format based on type
         if format_type == 'alpaca':
@@ -356,7 +356,14 @@ def train():
     )
     
     logger.info("\n🚀 Starting training...")
-    trainer.train()
+    
+    # Check if we should resume from checkpoint
+    resume_checkpoint = None
+    if training_args.resume_from_checkpoint is not None:
+        resume_checkpoint = training_args.resume_from_checkpoint
+        logger.info(f"   Resuming from checkpoint: {resume_checkpoint}")
+    
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     
     logger.info("\n💾 Saving model...")
     trainer.save_state()

@@ -39,7 +39,6 @@ def upcycle_llama_3b():
     
     # Configuration
     base_model_name = "meta-llama/Llama-3.2-3B-Instruct"
-    local_path = "models/Llama-3.2-3B-Instruct"
     save_path = "models/Llama-3.2-3B-Instruct-MoE-8x"
     
     num_experts = 8
@@ -56,15 +55,11 @@ def upcycle_llama_3b():
     print()
     
     # 1. Load base model
-    print("📂 Step 1: Loading base model...")
+    print("📂 Step 1: Loading base model from HuggingFace...")
+    print(f"   Model: {base_model_name}")
+    print(f"   (This will download the model if not cached)")
     
-    # Try local path first
-    if os.path.exists(local_path):
-        model_path = local_path
-        print(f"   Using local model: {local_path}")
-    else:
-        print(f"   Local model not found, trying HuggingFace...")
-        model_path = base_model_name
+    model_path = base_model_name
     
     try:
         llama_model = AutoModelForCausalLM.from_pretrained(
@@ -77,11 +72,11 @@ def upcycle_llama_3b():
         print(f"   ✅ Loaded model: {llama_model.config.hidden_size}d hidden size")
     except Exception as e:
         print(f"   ❌ Failed to load model: {e}")
-        print(f"   Please download the model first:")
-        print(f"   huggingface-cli download {base_model_name} --local-dir {local_path}")
+        print(f"   Make sure you have HuggingFace access and valid credentials.")
+        print(f"   Run: huggingface-cli login")
         return False
     
-    # Also load tokenizer
+    # Load tokenizer from the same source as the model
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -89,8 +84,10 @@ def upcycle_llama_3b():
         )
         print(f"   ✅ Loaded tokenizer: vocab size {len(tokenizer)}")
     except Exception as e:
-        print(f"   ⚠️  Tokenizer loading failed: {e}")
-        tokenizer = None
+        print(f"   ❌ Failed to load tokenizer: {e}")
+        print(f"   The model was loaded but tokenizer failed.")
+        print(f"   This should not happen if you downloaded from HuggingFace.")
+        return False
     
     # 2. Create MoE Config
     print()
@@ -213,10 +210,9 @@ def upcycle_llama_3b():
     os.makedirs(save_path, exist_ok=True)
     moe_model.save_pretrained(save_path, safe_serialization=True)
     
-    # Save tokenizer if loaded
-    if tokenizer is not None:
-        tokenizer.save_pretrained(save_path)
-        print(f"   ✅ Tokenizer saved")
+    # Save tokenizer
+    tokenizer.save_pretrained(save_path)
+    print(f"   ✅ Tokenizer saved")
     
     # Save config
     moe_config.save_pretrained(save_path)
@@ -227,9 +223,27 @@ def upcycle_llama_3b():
     print("✅ Upcycling Complete!")
     print("=" * 80)
     print()
+    
+    # Check if tokenizer files exist
+    tokenizer_files_exist = (
+        os.path.exists(os.path.join(save_path, "tokenizer.json")) or
+        os.path.exists(os.path.join(save_path, "tokenizer_config.json"))
+    )
+    
+    if not tokenizer_files_exist:
+        print("⚠️  WARNING: Tokenizer files are missing!")
+        print()
+        print("This should not happen. To fix, run:")
+        print(f"  python3 scripts/copy_tokenizer.py meta-llama/Llama-3.2-3B-Instruct {save_path}")
+        print()
+    
     print("Next steps:")
     print(f"  1. Verify model: ls -lh {save_path}")
-    print(f"  2. Start training with: bash scripts/run_sft_moe.sh")
+    if not tokenizer_files_exist:
+        print(f"  2. Copy tokenizer files (see warning above)")
+        print(f"  3. Start training with: bash scripts/run_mixed_sft.sh")
+    else:
+        print(f"  2. Start training with: bash scripts/run_mixed_sft.sh")
     print()
     
     return True
