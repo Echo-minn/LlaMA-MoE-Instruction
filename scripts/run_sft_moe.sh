@@ -24,8 +24,8 @@ deepspeed --include localhost:4,5,6,7 src/train_sft.py \
     --data_path $DATA_PATH \
     --output_dir $OUTPUT_DIR \
     --bf16 True \
-    --use_lora True \
-    --use_qlora False \
+    --use_lora False \
+    --use_qlora True \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \

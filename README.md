@@ -12,7 +12,7 @@ bash scripts/get_init_model.sh
 
 4. Convert the model to MoE
 ```bash
-bash scripts/convert_llama_to_moe.sh
+bash scripts/convert_llama3b_to_moe.sh
 ```
 
 ## Train the model

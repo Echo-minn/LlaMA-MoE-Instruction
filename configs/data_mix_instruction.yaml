@@ -1,0 +1,111 @@
+# Mixed Dataset Configuration for MoE Expert Specialization
+# Purpose: Train different experts on different task types
+
+# Training mode
+mode: "full"  # "validation" or "full"
+# validation: Use only first dataset with 5000 samples
+# full: Use all datasets with full samples
+
+# Dataset configurations
+datasets:
+  # 1. General Instruction Following
+  - name: "vicgalle/alpaca-gpt4"
+    enabled: true              # Set to false to disable
+    samples: 15000            # Number of samples (full mode)
+    samples_validation: 5000  # Number of samples (validation mode)
+    weight: 0.3               # Sampling weight in full mode
+    description: "High-quality general instructions from GPT-4"
+    task_type: "general_instruction"
+    format: "alpaca"          # Data format
+    
+  # 2. Multi-turn Conversation
+  - name: "OpenAssistant/oasst2"
+    enabled: true              # 🔧 Set to true for full training
+    samples: 12000
+    samples_validation: 3000
+    weight: 0.25
+    description: "Multi-turn conversational data"
+    task_type: "conversation"
+    format: "oasst"
+    
+  # 3. Code Generation
+  - name: "iamtarun/python_code_instructions_18k_alpaca"
+    enabled: true              # 🔧 Set to true for full training
+    samples: 10000
+    samples_validation: 2000
+    weight: 0.2
+    description: "Python code generation tasks"
+    task_type: "code"
+    format: "alpaca"
+    
+  # 4. Mathematical Reasoning
+  - name: "gsm8k"
+    config: "main"             # Required: 'main' or 'socratic'
+    enabled: true              # 🔧 Set to true for full training
+    samples: 8000
+    samples_validation: 2000
+    weight: 0.15
+    description: "Grade school math problems with reasoning"
+    task_type: "reasoning"
+    format: "gsm8k"
+    split: "train"
+    
+  # 5. Creative Writing & Complex Tasks
+  - name: "garage-bAInd/Open-Platypus"
+    enabled: true              # 🔧 Set to true for full training
+    samples: 5000
+    samples_validation: 1000
+    weight: 0.1
+    description: "STEM and logic questions"
+    task_type: "creative"
+    format: "alpaca"
+
+# Data processing
+processing:
+  max_seq_length: 1024        # Shorter for 3B model
+  shuffle: true               # Shuffle mixed dataset
+  seed: 42                    # Random seed
+  
+  # Prompt template
+  prompt_template: |
+    ### Instruction:
+    {instruction}
+    
+    ### Response:
+    {response}
+
+# Training parameters (can override in command line)
+training:
+  # These are defaults, can be overridden by command line args
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  
+  # Validation mode
+  validation_steps: 500       # For quick validation
+  
+  # Full mode
+  full_steps: 5000           # For full training
+
+# Expected outcomes
+expected_specialization:
+  expert_1_2: "General instruction understanding"
+  expert_3_4: "Conversation and dialogue"
+  expert_5_6: "Code and technical tasks"
+  expert_7_8: "Reasoning and mathematics"
+
+# Notes
+notes: |
+  Quick Start (Validation Mode):
+    1. Keep mode: "validation"
+    2. Only first dataset will be used (5000 samples)
+    3. Training time: ~30 minutes
+    4. Purpose: Verify pipeline works
+  
+  Full Training Mode:
+    1. Change mode: "full"
+    2. Set enabled: true for all datasets
+    3. All datasets will be mixed
+    4. Training time: ~2-3 hours
+    5. Purpose: Train production model
+
