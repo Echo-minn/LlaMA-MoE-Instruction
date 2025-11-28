@@ -67,7 +67,7 @@ def load_model(model_path, device="cuda", load_in_4bit=False):
     # Prepare model loading kwargs
     model_kwargs = {
         "trust_remote_code": True,
-        "torch_dtype": torch.bfloat16,
+        "dtype": torch.bfloat16,
         "device_map": "auto" if device == "cuda" else "cpu",
     }
     

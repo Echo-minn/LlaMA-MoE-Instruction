@@ -131,9 +131,9 @@ def train():
             bnb_4bit_use_double_quant=True,
         )
         model_kwargs["quantization_config"] = bnb_config
-        model_kwargs["torch_dtype"] = torch.bfloat16
+        model_kwargs["dtype"] = torch.bfloat16
     else:
-        model_kwargs["torch_dtype"] = torch.bfloat16 if training_args.bf16 else torch.float16
+        model_kwargs["dtype"] = torch.bfloat16 if training_args.bf16 else torch.float16
 
     model = LlamaMoEForCausalLM.from_pretrained(
         model_args.model_name_or_path, 

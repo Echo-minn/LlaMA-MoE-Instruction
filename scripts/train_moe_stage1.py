@@ -72,20 +72,25 @@ def format_alpaca(example):
     
     return {'instruction': prompt, 'response': output}
 
-def format_oasst(example):
-    """Format OASST conversation data"""
-    # OASST has message tree structure
-    # For simplicity, take first user-assistant pair
+def format_ultrachat(example):
+    """Format UltraChat conversation data"""
     messages = example.get('messages', [])
     
+    if not messages or len(messages) < 2:
+        return {'instruction': '', 'response': ''}
+    
+    # Take first user message as instruction and first assistant message as response
     instruction = ""
     response = ""
     
     for msg in messages:
-        if msg.get('role') == 'user' and not instruction:
-            instruction = msg.get('content', '')
-        elif msg.get('role') == 'assistant' and not response:
-            response = msg.get('content', '')
+        role = msg.get('role', '')
+        content = msg.get('content', '')
+        
+        if role == 'user' and not instruction:
+            instruction = content
+        elif role == 'assistant' and instruction and not response:
+            response = content
             break
     
     return {'instruction': instruction, 'response': response}
@@ -124,8 +129,11 @@ def load_single_dataset(dataset_config, mode='validation'):
         # Format based on type
         if format_type == 'alpaca':
             dataset = dataset.map(format_alpaca, remove_columns=dataset.column_names)
+        elif format_type == 'ultrachat':
+            dataset = dataset.map(format_ultrachat, remove_columns=dataset.column_names)
         elif format_type == 'oasst':
-            dataset = dataset.map(format_oasst, remove_columns=dataset.column_names)
+            # Legacy support for oasst format
+            dataset = dataset.map(format_ultrachat, remove_columns=dataset.column_names)
         elif format_type == 'gsm8k':
             dataset = dataset.map(format_gsm8k, remove_columns=dataset.column_names)
         
@@ -274,7 +282,7 @@ def train():
     
     model_kwargs = {
         "trust_remote_code": True,
-        "torch_dtype": torch.bfloat16,
+        "dtype": torch.bfloat16,
     }
     
     if model_args.use_flash_attn:

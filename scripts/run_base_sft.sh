@@ -1,16 +1,17 @@
 #!/bin/bash
 
-# Mixed Dataset SFT Training Script
+# QLoRA Fine-tuning Script for Standard Llama Base Models
+# Uses the same mixed dataset configuration as MoE training
 # Supports validation mode (quick test) and full mode (production)
 # Supports resuming from checkpoint
 #
 # Usage:
-#   bash scripts/run_mixed_sft.sh                          # Start new training
-#   bash scripts/run_mixed_sft.sh --resume                 # Auto-resume from latest checkpoint
-#   bash scripts/run_mixed_sft.sh --resume checkpoint-500  # Resume from specific checkpoint
+#   bash scripts/run_base_sft.sh                          # Start new training
+#   bash scripts/run_base_sft.sh --resume                 # Auto-resume from latest checkpoint
+#   bash scripts/run_base_sft.sh --resume checkpoint-500  # Resume from specific checkpoint
 
 echo "=========================================="
-echo "Mixed Dataset SFT Training"
+echo "QLoRA Fine-tuning for Llama Base Model"
 echo "=========================================="
 echo ""
 
@@ -34,8 +35,9 @@ export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 export TRANSFORMERS_VERBOSITY=warning
 
 # Model Configuration
-MODEL_PATH="models/Llama-3.2-3B-Instruct-MoE-8x"
+MODEL_PATH="models/Llama-3.2-3B"
 DATA_CONFIG="configs/data_mix_instruction.yaml"
+RUN_NAME="base-1"  # Set custom wandb run name (optional)
 
 # Check mode from config
 MODE=$(python3 -c "import yaml; print(yaml.safe_load(open('$DATA_CONFIG'))['mode'])")
@@ -46,7 +48,7 @@ if [ "$MODE" == "validation" ]; then
     echo "   Purpose: Quick pipeline test"
     echo "   Time: ~30 minutes"
     echo ""
-    OUTPUT_DIR="outputs/validation-mixed-sft"
+    OUTPUT_DIR="outputs/validation-base-sft"
     MAX_STEPS=500
     BATCH_SIZE=8
     GRAD_ACCUM=1
@@ -58,9 +60,9 @@ elif [ "$MODE" == "full" ]; then
     echo "   Using: All enabled datasets (~45K samples)"
     echo "   Purpose: Production model"
     echo ""
-    OUTPUT_DIR="outputs/llama-3b-moe-mixed-sft"
+    OUTPUT_DIR="outputs/llama-3b-base-sft"
     MAX_STEPS=5000
-    BATCH_SIZE=12
+    BATCH_SIZE=16
     GRAD_ACCUM=2
     GRADIENT_CKPT="True"
     SAVE_STEPS=500
@@ -72,12 +74,13 @@ else
 fi
 
 echo "📋 Configuration:"
-echo "   Model: $MODEL_PATH"
+echo "   Model: $MODEL_PATH (Standard Llama Base Model)"
 echo "   Data config: $DATA_CONFIG"
 echo "   Output: $OUTPUT_DIR"
 echo "   GPUs: $GPU_IDS"
 echo "   Max steps: $MAX_STEPS"
 echo "   Batch size: $NUM_GPUS × $BATCH_SIZE × $GRAD_ACCUM = $((NUM_GPUS * BATCH_SIZE * GRAD_ACCUM))"
+echo "   QLoRA: Enabled (4-bit + LoRA)"
 
 # Check for existing checkpoints if resume requested
 if [ "$RESUME_FROM_CHECKPOINT" == "auto" ]; then
@@ -120,18 +123,18 @@ fi
 
 # Run training
 deepspeed --include localhost:$GPU_IDS \
-    scripts/train_mixed_sft.py \
+    scripts/train_base_sft.py \
     --deepspeed distributed-training/zero2.json \
     --model_name_or_path $MODEL_PATH \
     --data_config $DATA_CONFIG \
     --output_dir $OUTPUT_DIR \
     $RESUME_ARG \
+    --run-name $RUN_NAME \
     --bf16 True \
     --use_qlora True \
     --lora_r 64 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
-    --num_train_epochs 1 \
     --max_steps $MAX_STEPS \
     --per_device_train_batch_size $BATCH_SIZE \
     --gradient_accumulation_steps $GRAD_ACCUM \
@@ -156,7 +159,6 @@ deepspeed --include localhost:$GPU_IDS \
     --ddp_find_unused_parameters False \
     --ddp_bucket_cap_mb 25
 
-# Check if training succeeded
 TRAINING_EXIT_CODE=$?
 
 echo ""
@@ -166,6 +168,14 @@ if [ $TRAINING_EXIT_CODE -eq 0 ]; then
     echo "=========================================="
     echo ""
     echo "Model saved to: $OUTPUT_DIR"
+    echo ""
+    echo "📦 Trained with QLoRA - LoRA adapters saved"
+    echo ""
+    echo "To merge LoRA adapters with base model:"
+    echo "  python scripts/merge_lora.py \\"
+    echo "    --base_model $MODEL_PATH \\"
+    echo "    --lora_model $OUTPUT_DIR \\"
+    echo "    --output_dir $OUTPUT_DIR-merged"
     echo ""
 else
     echo "❌ Training Failed!"
@@ -185,6 +195,6 @@ if [ $TRAINING_EXIT_CODE -eq 0 ] && [ "$MODE" == "validation" ]; then
     echo "  3. If all good, switch to full mode:"
     echo "     Edit $DATA_CONFIG"
     echo "     Change: mode: \"validation\" → mode: \"full\""
-    echo "     Run: bash scripts/run_mixed_sft.sh"
+    echo "     Run: bash scripts/run_base_sft.sh"
 fi
 

@@ -1,0 +1,123 @@
+# Task-Grouped Dataset Configuration for MoE Stage 2 Training
+# Purpose: Sequential task training for expert specialization
+# Strategy: Train on one task at a time in cycles (math → code → general → conversation → other → repeat)
+
+mode: "task_grouped"  # Different from "full" or "validation"
+
+datasets:
+  # Task 1: Math
+  - name: "gsm8k"
+    config: "main"
+    enabled: true
+    samples: 12000
+    samples_validation: 1000
+    weight: 1.0
+    description: "Grade school math problems with reasoning"
+    task_type: "math"
+    format: "gsm8k"
+    split: "train"
+    steps_per_cycle: 300
+    
+  # Task 2: Code
+  - name: "iamtarun/python_code_instructions_18k_alpaca"
+    enabled: true
+    samples: 12000
+    samples_validation: 1000
+    weight: 1.0
+    description: "Python code generation tasks"
+    task_type: "code"
+    format: "alpaca"
+    steps_per_cycle: 300
+    
+  # Task 3: General Instruction Following
+  - name: "vicgalle/alpaca-gpt4"
+    enabled: true
+    samples: 10000
+    samples_validation: 1000
+    weight: 1.0
+    description: "High-quality general instructions from GPT-4"
+    task_type: "general"
+    format: "alpaca"
+    steps_per_cycle: 300
+    
+  # Task 4: Multi-turn Conversation
+  - name: "HuggingFaceH4/ultrachat_200k"
+    enabled: true
+    samples: 8000
+    samples_validation: 800
+    weight: 1.0
+    description: "Multi-turn conversational data"
+    task_type: "conversation"
+    format: "ultrachat"
+    split: "train_sft"
+    steps_per_cycle: 300
+    
+  # Task 5: Creative/STEM
+  - name: "garage-bAInd/Open-Platypus"
+    enabled: true
+    samples: 8000
+    samples_validation: 800
+    weight: 1.0
+    description: "STEM and logic questions"
+    task_type: "other"
+    format: "alpaca"
+    steps_per_cycle: 300
+
+
+processing:
+  max_seq_length: 1024
+  shuffle_within_task: true  # Shuffle samples within each task
+  shuffle_across_tasks: false  # DO NOT shuffle across tasks
+  seed: 42
+
+  prompt_template: |
+    ### Instruction:
+    {instruction}
+    
+    ### Response:
+    {response}
+
+# Training parameters for Stage 2
+training:
+  cycle_strategy: "sequential"  # Train tasks in order: math → code → general → conversation → other
+  steps_per_task: 300  # Steps on each task before switching
+  total_cycles: 2  # Complete 2 full cycles through all 5 tasks
+  total_steps: 3000  # 5 tasks × 300 steps × 2 cycles = 3000 steps
+  
+  # Hyperparameters (optimized for stage 2)
+  per_device_train_batch_size: 12
+  gradient_accumulation_steps: 2
+  learning_rate: 3.0e-6  # Lower than stage 1 (8e-6)
+  warmup_ratio: 0.15  # Longer than stage 1 (0.1)
+  
+  # Load balancing (increased from stage 1)
+  aux_loss_alpha: 0.01  # 10x increase from 0.001
+  
+  # Checkpointing
+  save_steps: 300  # Save at end of each task
+  eval_steps: 300  # Evaluate at end of each task
+
+# Trainable parameters for Stage 2
+trainable_modules:
+  gates: true  # MoE gate/router parameters
+  expert_ffn_lora: true  # LoRA on expert FFN (gate_proj, up_proj, down_proj)
+  attention_lora: false  # FROZEN: q_proj, k_proj, v_proj, o_proj
+  shared_expert: true
+  
+frozen_modules:
+  attention_lora: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# Expected outcomes
+expected_specialization:
+  cycle_1:
+    math_steps: "0-299: Experts learn math patterns"
+    code_steps: "300-599: Experts learn code patterns"
+    general_steps: "600-899: Experts learn general instruction"
+    conversation_steps: "900-1199: Experts learn dialogue"
+    other_steps: "1200-1499: Experts learn STEM/logic"
+  cycle_2:
+    math_steps: "1500-1799: Reinforce math specialization"
+    code_steps: "1800-2099: Reinforce code specialization"
+    general_steps: "2100-2399: Reinforce general specialization"
+    conversation_steps: "2400-2699: Reinforce dialogue specialization"
+    other_steps: "2700-2999: Reinforce STEM/logic specialization"

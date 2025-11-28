@@ -64,7 +64,7 @@ def upcycle_llama_3b():
     try:
         llama_model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="cpu",
             low_cpu_mem_usage=True,
             trust_remote_code=True

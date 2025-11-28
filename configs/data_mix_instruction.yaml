@@ -19,14 +19,15 @@ datasets:
     format: "alpaca"          # Data format
     
   # 2. Multi-turn Conversation
-  - name: "OpenAssistant/oasst2"
+  - name: "HuggingFaceH4/ultrachat_200k"
     enabled: true              # 🔧 Set to true for full training
     samples: 12000
     samples_validation: 3000
     weight: 0.25
     description: "Multi-turn conversational data"
     task_type: "conversation"
-    format: "oasst"
+    format: "ultrachat"
+    split: "train_sft"
     
   # 3. Code Generation
   - name: "iamtarun/python_code_instructions_18k_alpaca"
