@@ -11,6 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, List
 import torch
+import numpy as np
 from datasets import load_dataset, concatenate_datasets, Dataset
 from transformers import (
     AutoTokenizer,
@@ -195,17 +196,23 @@ def load_mixed_datasets(config_path, mode='validation'):
     return mixed_dataset, config
 
 def tokenize_function(examples, tokenizer, max_length):
-    """Tokenize examples with instruction masking"""
+    """Tokenize examples with instruction masking and task-specific tokens"""
     instructions = examples['instruction']
     responses = examples['response']
+    task_types = examples.get('task_type', [None] * len(instructions))
     
     all_input_ids = []
     all_labels = []
     all_attention_mask = []
     
-    for instruction, response in zip(instructions, responses):
+    for instruction, response, task_type in zip(instructions, responses, task_types):
+        # Prepend task-specific token if available
+        task_prefix = ""
+        if task_type:
+            task_prefix = f"<|task_{task_type}|> "
+        
         # Build prompt
-        instruction_text = f"### Instruction:\n{instruction}\n\n### Response:\n"
+        instruction_text = f"{task_prefix}### Instruction:\n{instruction}\n\n### Response:\n"
         
         # Tokenize
         instruction_tokens = tokenizer(
@@ -333,7 +340,7 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    
+
     # Tokenize datasets
     logger.info("Tokenizing datasets...")
     
@@ -373,9 +380,30 @@ def train():
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     
     logger.info("\n💾 Saving model...")
+    
+    # Ensure config has correct model_type before saving
+    if hasattr(model, 'config') and hasattr(model.config, 'model_type'):
+        if model.config.model_type != "llama_moe":
+            logger.warning(f"Fixing model_type in config: {model.config.model_type} -> llama_moe")
+            model.config.model_type = "llama_moe"
+    
     trainer.save_state()
     trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
+    
+    # Verify saved config has correct model_type
+    import json
+    import os
+    config_path = os.path.join(training_args.output_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        if config_dict.get("model_type") != "llama_moe":
+            logger.warning(f"Fixing model_type in saved config.json: {config_dict.get('model_type')} -> llama_moe")
+            config_dict["model_type"] = "llama_moe"
+            with open(config_path, 'w') as f:
+                json.dump(config_dict, f, indent=2)
+            logger.info("✅ Fixed config.json model_type")
     
     logger.info("\n✅ Training complete!")
 

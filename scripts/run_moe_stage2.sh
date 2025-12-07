@@ -54,17 +54,17 @@ export TRANSFORMERS_VERBOSITY=warning
 # Model Configuration
 MODEL_PATH="$STAGE1_CHECKPOINT"
 DATA_CONFIG="configs/data_task_grouped.yaml"
-OUTPUT_DIR="outputs/llama-3b-moe-stage2"
-RUN_NAME="moe-stage2"
+OUTPUT_DIR="outputs/llama-3b-moe-stage3"
+RUN_NAME="moe-stage3"
 
 # Stage 2 Hyperparameters
-MAX_STEPS=3000        # 5 tasks × 300 steps × 2 cycles
-BATCH_SIZE=12         # Same as stage 1
+MAX_STEPS=1500        # 5 tasks × 300 steps × 2 cycles
+BATCH_SIZE=13         # Training batch size
 GRAD_ACCUM=2          # Same as stage 1
 LEARNING_RATE=3e-6    # Lower than stage 1 (8e-6)
 WARMUP_RATIO=0.15     # Longer than stage 1 (0.1)
 AUX_LOSS_ALPHA=0.01   # 10x higher than stage 1 (0.001)
-SAVE_STEPS=300        # Save at end of each task
+SAVE_STEPS=100        # Save at end of each task
 EVAL_STEPS=300        # Evaluate at end of each task
 GRADIENT_CKPT="True"
 
@@ -110,7 +110,7 @@ deepspeed --include localhost:$GPU_IDS \
     --learning_rate $LEARNING_RATE \
     --lr_scheduler_type cosine \
     --warmup_ratio $WARMUP_RATIO \
-    --logging_steps 50 \
+    --logging_steps 30 \
     --log_level warning \
     --disable_tqdm False \
     --report_to wandb \

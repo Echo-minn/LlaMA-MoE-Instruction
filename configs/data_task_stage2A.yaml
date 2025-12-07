@@ -1,0 +1,78 @@
+mode: "stage2A"
+
+datasets:
+  # Task 1: Math
+  - name: "gsm8k"
+    train_split: 'train'
+    vali_split: 'test'
+    enabled: true
+    train_samples: 7200
+    validation_samples: 72
+    description: "Grade school math problems with reasoning"
+    steps_per_cycle: 300
+    
+  # Task 2: Code
+  - name: "iamtarun/python_code_instructions_18k_alpaca"
+    train_split: 'train'
+    vali_split: 'train'
+    enabled: true
+    train_samples: 12000
+    validation_samples: 120
+    description: "Python code generation tasks"
+    steps_per_cycle: 300
+    
+  # Task 3: Summarization 3.0.0
+  - name: "abisee/cnn_dailymail"
+    config: "3.0.0"
+    train_split: 'train'
+    vali_split: 'validation'
+    enabled: true
+    train_samples: 9000
+    validation_samples: 90
+    description: "CNN / DailyMail Dataset is an English-language dataset and summarization"
+    streaming: true
+    steps_per_cycle: 300
+    
+  # Task 4: Translation zh-en
+  - name: "wmt/wmt19"
+    config: "zh-en"
+    enabled: true
+    train_split: 'train'
+    vali_split: 'validation'
+    train_samples: 9000
+    validation_samples: 90
+    description: "WMT19 Dataset is a translation dataset"
+    streaming: true
+    steps_per_cycle: 300
+    
+
+
+processing:
+  max_seq_length: 1024
+  shuffle_within_task: true  # Shuffle samples within each task
+  shuffle_across_tasks: false  # DO NOT shuffle across tasks
+  seed: 42
+
+  prompt_template: |
+    ### Instruction:
+    {instruction}
+    
+    ### Response:
+    {response}
+
+# Note: All training hyperparameters (batch sizes, learning rate, steps, etc.) 
+# are configured in the shell script (run_moe_stage2A.sh), not in this YAML file.
+# This YAML file only contains data and processing configuration.
+
+# Trainable parameters for Stage 2
+trainable_modules:
+  gates: true  # MoE gate/router parameters
+  expert_ffn_lora: true  # LoRA on expert FFN (gate_proj, up_proj, down_proj)
+  attention_lora: false  # FROZEN: q_proj, k_proj, v_proj, o_proj
+  shared_expert: true
+  
+frozen_modules:
+  attention_lora: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# Expected outcomes
+expected_specialization:

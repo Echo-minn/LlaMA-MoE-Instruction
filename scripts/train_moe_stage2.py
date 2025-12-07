@@ -11,6 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 import torch
+import numpy as np
 from datasets import load_dataset, Dataset
 from transformers import (
     AutoTokenizer,
@@ -179,16 +180,22 @@ def load_task_grouped_datasets(config_path):
 
 
 def tokenize_function(examples, tokenizer, max_length):
-    """Tokenize examples with instruction masking"""
+    """Tokenize examples with instruction masking and task-specific tokens"""
     instructions = examples['instruction']
     responses = examples['response']
+    task_types = examples.get('task_type', [None] * len(instructions))
     
     all_input_ids = []
     all_labels = []
     all_attention_mask = []
     
-    for instruction, response in zip(instructions, responses):
-        instruction_text = f"### Instruction:\n{instruction}\n\n### Response:\n"
+    for instruction, response, task_type in zip(instructions, responses, task_types):
+        # Prepend task-specific token if available
+        task_prefix = ""
+        if task_type:
+            task_prefix = f"<|task_{task_type}|> "
+        
+        instruction_text = f"{task_prefix}### Instruction:\n{instruction}\n\n### Response:\n"
         
         instruction_tokens = tokenizer(
             instruction_text,
@@ -306,16 +313,82 @@ class TaskCyclingTrainer(Trainer):
 
 
 class TaskLoggingCallback(TrainerCallback):
-    """Callback to log current task to wandb"""
+    """Callback to log current task and compute perplexity from loss"""
     
     def __init__(self, trainer):
         self.trainer = trainer
     
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if hasattr(self.trainer, 'current_task'):
-            if logs is not None:
+        if logs is not None:
+            # Add task info
+            if hasattr(self.trainer, 'current_task'):
                 logs['task'] = self.trainer.current_task
                 logs['task_step'] = self.trainer.steps_in_current_task
+            
+            # Compute perplexity from loss
+            if 'loss' in logs:
+                logs['train_perplexity'] = np.exp(logs['loss'])
+            if 'eval_loss' in logs:
+                logs['eval_perplexity'] = np.exp(logs['eval_loss'])
+
+
+class ExpertUtilizationCallback(TrainerCallback):
+    """Callback to track and log MoE expert utilization statistics"""
+    
+    def __init__(self):
+        self.expert_counts = {}
+        self.step_count = 0
+    
+    def on_log(self, args, state, control, logs=None, model=None, **kwargs):
+        """Log expert utilization statistics"""
+        if logs is None or model is None:
+            return
+        
+        # Collect routing statistics from the model
+        try:
+            expert_usage = []
+            total_tokens = 0
+            
+            # Iterate through MoE layers to get expert selection counts
+            for name, module in model.named_modules():
+                if hasattr(module, 'gate') and hasattr(module.gate, 'expert_counts'):
+                    # Some gate implementations track expert selection
+                    counts = module.gate.expert_counts
+                    expert_usage.append(counts)
+                    total_tokens += counts.sum()
+            
+            if expert_usage and total_tokens > 0:
+                # Compute statistics
+                avg_usage = np.mean(expert_usage, axis=0)  # Average across layers
+                
+                # Normalize to get probabilities
+                usage_probs = avg_usage / avg_usage.sum() if avg_usage.sum() > 0 else avg_usage
+                
+                # Compute entropy (higher = more balanced usage)
+                eps = 1e-10
+                entropy = -np.sum(usage_probs * np.log(usage_probs + eps))
+                max_entropy = np.log(len(usage_probs))
+                normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+                
+                # Compute coefficient of variation (lower = more balanced)
+                mean_usage = np.mean(avg_usage)
+                std_usage = np.std(avg_usage)
+                cv = std_usage / mean_usage if mean_usage > 0 else 0
+                
+                # Log metrics
+                logs['expert_entropy'] = float(normalized_entropy)
+                logs['expert_balance_cv'] = float(cv)
+                logs['expert_max_usage'] = float(np.max(usage_probs))
+                logs['expert_min_usage'] = float(np.min(usage_probs))
+                
+                # Log individual expert usage (top 8 experts for 8-expert model)
+                for i, usage in enumerate(usage_probs[:8]):
+                    logs[f'expert_{i}_usage'] = float(usage)
+                    
+        except Exception as e:
+            # Silently skip if we can't get expert stats
+            logger.debug(f"Could not collect expert stats: {e}")
+            pass
 
 
 def freeze_attention_lora(model):
@@ -363,6 +436,38 @@ def update_model_aux_loss_alpha(model, aux_loss_alpha):
             logger.info(f"  Updated {name}.gate.alpha = {aux_loss_alpha}")
     
     logger.info("")
+
+
+def compute_metrics(eval_preds):
+    """Compute accuracy for evaluation (memory-efficient version)"""
+    predictions, labels = eval_preds
+    
+    # predictions shape: (batch_size, seq_len) - argmax predictions only
+    # labels shape: (batch_size, seq_len)
+    
+    # Note: We removed perplexity calculation to avoid OOM from storing full logits
+    # Perplexity can be approximated from eval_loss: perplexity ≈ exp(loss)
+    
+    # Flatten arrays
+    predictions = predictions.flatten()
+    labels = labels.flatten()
+    
+    # Only compute accuracy on non-masked tokens (labels != -100)
+    mask = labels != -100
+    
+    if mask.sum() == 0:
+        return {"accuracy": 0.0}
+    
+    # Compute accuracy
+    correct = (predictions[mask] == labels[mask]).sum()
+    total = mask.sum()
+    accuracy = float(correct) / float(total)
+    
+    return {
+        "accuracy": accuracy,
+        "correct_tokens": int(correct),
+        "total_tokens": int(total),
+    }
 
 
 def train():
@@ -446,6 +551,26 @@ def train():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
+    # Add task-specific special tokens
+    task_tokens = [
+        "<|task_math|>",
+        "<|task_code|>",
+        "<|task_general|>",
+        "<|task_conversation|>",
+        "<|task_other|>",
+        "<|task_general_instruction|>",
+        "<|task_reasoning|>",
+        "<|task_creative|>",
+    ]
+    
+    logger.info("\n🏷️  Adding task-specific special tokens...")
+    num_added = tokenizer.add_special_tokens({"additional_special_tokens": task_tokens})
+    logger.info(f"  Added {num_added} task tokens: {', '.join(task_tokens)}")
+    
+    # Resize model embeddings to accommodate new tokens
+    model.resize_token_embeddings(len(tokenizer))
+    logger.info(f"  Resized embeddings to {len(tokenizer)} tokens\n")
+    
     # Tokenize all task datasets
     logger.info("Tokenizing task datasets...")
     tokenized_task_datasets = {}
@@ -481,7 +606,7 @@ def train():
             remove_columns=eval_ds.column_names,
             num_proc=2,
         )
-        # Take subset for eval
+        # Take subset for eval (100 samples per task for final evaluation)
         eval_ds = eval_ds.select(range(min(100, len(eval_ds))))
         eval_datasets.append(eval_ds)
     
@@ -503,6 +628,9 @@ def train():
     # Add task logging callback
     trainer.add_callback(TaskLoggingCallback(trainer))
     
+    # Add expert utilization tracking
+    trainer.add_callback(ExpertUtilizationCallback())
+    
     logger.info("🚀 Starting Stage 2 training...")
     logger.info(f"  Task order: {' → '.join(tokenized_task_datasets.keys())}")
     logger.info(f"  Steps per task: {steps_per_task}")
@@ -517,9 +645,30 @@ def train():
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     
     logger.info("\n💾 Saving model...")
+    
+    # Ensure config has correct model_type before saving
+    if hasattr(model, 'config') and hasattr(model.config, 'model_type'):
+        if model.config.model_type != "llama_moe":
+            logger.warning(f"Fixing model_type in config: {model.config.model_type} -> llama_moe")
+            model.config.model_type = "llama_moe"
+    
     trainer.save_state()
     trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
+    
+    # Verify saved config has correct model_type
+    import json
+    import os
+    config_path = os.path.join(training_args.output_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        if config_dict.get("model_type") != "llama_moe":
+            logger.warning(f"Fixing model_type in saved config.json: {config_dict.get('model_type')} -> llama_moe")
+            config_dict["model_type"] = "llama_moe"
+            with open(config_path, 'w') as f:
+                json.dump(config_dict, f, indent=2)
+            logger.info("✅ Fixed config.json model_type")
     
     logger.info("\n✅ Stage 2 training complete!")
     logger.info(f"\n📊 Next step: Check routing with:")

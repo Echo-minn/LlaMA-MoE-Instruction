@@ -296,11 +296,16 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        
+        # Track expert usage for monitoring (reset on each logging step)
+        self.register_buffer('expert_counts', torch.zeros(self.n_routed_experts, dtype=torch.long))
+        
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        import torch.nn.init  as init
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # Initialize with small random values to ensure uniform expert selection probabilities
+        # Small std ensures that logits are close to zero, leading to approximately uniform softmax
+        nn.init.normal_(self.weight, mean=0.0, std=0.001)
     
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape        
@@ -314,6 +319,14 @@ class MoEGate(nn.Module):
         
         ### select top-k experts
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        
+        # Track expert usage (only in training, accumulate counts)
+        if self.training and hasattr(self, 'expert_counts'):
+            # Count how many times each expert is selected
+            flat_topk_idx = topk_idx.view(-1)
+            # Count on same device as model
+            counts = torch.bincount(flat_topk_idx, minlength=self.n_routed_experts)
+            self.expert_counts += counts.long()
         
         ### norm gate to sum 1
         if self.top_k > 1 and self.norm_topk_prob:
@@ -1302,6 +1315,7 @@ class LlamaMoEForCausalLM(LlamaMoEPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = LlamaMoEModel(config)
         self.vocab_size = config.vocab_size
+        self.layers = config.layers
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -1423,9 +1437,23 @@ class LlamaMoEForCausalLM(LlamaMoEPreTrainedModel, GenerationMixin):
     ):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                # Compatible with different transformers versions
+                if hasattr(past_key_values, 'get_seq_length'):
+                    cache_length = past_key_values.get_seq_length()
+                    past_length = cache_length  # Use cache_length as past_length
+                elif hasattr(past_key_values, 'get_usable_length'):
+                    cache_length = past_key_values.get_usable_length(input_ids.shape[1] if input_ids is not None else 0)
+                    past_length = cache_length
+                elif hasattr(past_key_values, 'seen_tokens'):
+                    # Older API
+                    cache_length = past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 0
+                    past_length = past_key_values.seen_tokens
+                else:
+                    # Fallback
+                    cache_length = past_key_values[0][0].shape[2] if len(past_key_values) > 0 and len(past_key_values[0]) > 0 else 0
+                    past_length = cache_length
+                
+                max_cache_length = past_key_values.get_max_length() if hasattr(past_key_values, 'get_max_length') else None
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None

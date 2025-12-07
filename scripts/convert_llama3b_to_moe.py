@@ -39,7 +39,7 @@ def upcycle_llama_3b():
     
     # Configuration
     base_model_name = "meta-llama/Llama-3.2-3B-Instruct"
-    save_path = "models/Llama-3.2-3B-Instruct-MoE-8x"
+    save_path = "models/Llama-3.2-3B-Instruct-MoE"
     
     num_experts = 8
     experts_per_tok = 2
@@ -99,9 +99,7 @@ def upcycle_llama_3b():
     moe_config.n_routed_experts = num_experts
     moe_config.num_experts_per_tok = experts_per_tok
     
-    # For 3B model, adjust expert size
-    # Original FFN intermediate_size for 3B is typically 8192
-    # We reduce it for each expert to save memory
+    # Keep the same intermediate size as original model
     original_intermediate = moe_config.intermediate_size
     moe_config.moe_intermediate_size = original_intermediate // 2  # 4096 for 3B
     
@@ -123,6 +121,21 @@ def upcycle_llama_3b():
     
     moe_model = LlamaMoEForCausalLM(moe_config)
     moe_model.to(torch.bfloat16)
+    
+    # Explicitly (re)initialize all router weights with small random std for near-uniform routing
+    # This is run before any weight transplant; router weights are not copied from base model.
+    def _init_router_weights(model, std: float = 1e-4):
+        import torch.nn as nn
+        router_count = 0
+        for module in model.modules():
+            gate = getattr(module, "gate", None)
+            if gate is not None and hasattr(gate, "weight"):
+                nn.init.normal_(gate.weight, mean=0.0, std=std)
+                router_count += 1
+        return router_count, std
+    
+    router_count, router_std = _init_router_weights(moe_model, std=1e-4)
+    print(f"   ✅ Routers initialized: {router_count} (std={router_std})")
     
     total_params = sum(p.numel() for p in moe_model.parameters())
     print(f"   ✅ MoE model created: {total_params / 1e9:.2f}B parameters")
@@ -202,6 +215,82 @@ def upcycle_llama_3b():
     print(f"      Copied:  {copied_keys} keys")
     print(f"      New:     {new_keys} keys (routers)")
     print(f"      Skipped: {skipped_keys} keys")
+    
+    # 4.5. Verify router initialization
+    print()
+    print("🔍 Step 4.5: Verifying router initialization...")
+    
+    router_count = 0
+    router_stats = []
+    
+    with torch.no_grad():
+        for name, module in moe_model.named_modules():
+            if hasattr(module, 'gate') and hasattr(module.gate, 'weight'):
+                router_weight = module.gate.weight.data
+                router_count += 1
+                
+                # Check weight statistics
+                weight_mean = router_weight.mean().item()
+                weight_std = router_weight.std().item()
+                weight_min = router_weight.min().item()
+                weight_max = router_weight.max().item()
+                
+                router_stats.append({
+                    'name': name,
+                    'mean': weight_mean,
+                    'std': weight_std,
+                    'min': weight_min,
+                    'max': weight_max,
+                })
+                
+        
+        # Find first MoE layer to test
+        test_layer = None
+        for layer in moe_model.model.layers:
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
+                test_layer = layer.mlp
+                break
+        
+        if test_layer is not None:
+            # Create sample hidden states
+            batch_size = 4
+            seq_len = 16
+            hidden_size = moe_config.hidden_size
+            sample_hidden = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16)
+            
+            # Get router output
+            gate = test_layer.gate
+            topk_idx, topk_weight, aux_loss = gate(sample_hidden)
+            
+            # Compute expert selection probabilities
+            n_experts = gate.n_routed_experts
+            n_tokens = batch_size * seq_len
+            
+            # Count how many times each expert is selected
+            expert_counts = torch.zeros(n_experts, dtype=torch.long)
+            expert_counts.scatter_add_(0, topk_idx.view(-1), torch.ones_like(topk_idx.view(-1)))
+            
+            # Compute average probability per expert
+            expert_probs = expert_counts.float() / (n_tokens * gate.top_k)
+            expected_prob = 1.0 / n_experts
+            
+            print(f"      Tested {n_tokens} tokens with {gate.top_k} experts per token")
+            print(f"      Expert selection probabilities:")
+            for i, prob in enumerate(expert_probs):
+                deviation = abs(prob.item() - expected_prob)
+                print(f"        Expert {i}: {prob.item():.6f} (expected: {expected_prob:.6f}, dev: {deviation:.6f})")
+            
+            max_deviation = (expert_probs - expected_prob).abs().max().item()
+            print(f"      Max deviation from uniform: {max_deviation:.6f}")
+            
+            if max_deviation < 0.01:
+                print(f"   ✅ Router produces approximately uniform expert selection")
+            else:
+                print(f"   ⚠️  Router may not produce uniform selection (deviation: {max_deviation:.6f})")
+        else:
+            print("   ⚠️  Could not find MoE layer to test")
+    
+    print(f"   ✅ Verified {router_count} router(s)")
     
     # 5. Save model
     print()

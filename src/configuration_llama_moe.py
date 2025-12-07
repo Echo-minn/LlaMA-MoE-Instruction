@@ -88,23 +88,19 @@ class LlamaMoEConfig(PretrainedConfig):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
-    ```python
-    >>> from transformers import LlamaMoE, DeepseekConfig
-    >>> # Initializing a Deepseek deepseek-7b style configuration
-    >>> configuration = DeepseekConfig()
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```"""
+            """
 
     model_type = "llama_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        vocab_size=102400,
-        hidden_size=4096,
-        intermediate_size=11008,
-        moe_intermediate_size = 1407,
+        vocab_size=128256,
+        hidden_size=3072,
+        intermediate_size=8192,
+        moe_intermediate_size = 4096,
+        layers=28,
+        model_type = "llama_moe",
         num_hidden_layers=30,
         num_attention_heads=32,
         num_key_value_heads=8,
@@ -138,6 +134,8 @@ class LlamaMoEConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.moe_intermediate_size = moe_intermediate_size
+        self.layers = layers
+        self.model_type = model_type
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.n_shared_experts = n_shared_experts
