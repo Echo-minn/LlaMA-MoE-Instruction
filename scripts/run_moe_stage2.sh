@@ -1,116 +1,100 @@
 #!/bin/bash
-
 # Stage 2: Task-Grouped MoE Training for Expert Specialization
-# Sequential task training with frozen attention LoRA
-#
-# Usage:
-#   bash scripts/run_moe_stage2.sh                    # Auto-resume from latest stage 1 checkpoint
-#   bash scripts/run_moe_stage2.sh checkpoint-4500    # Resume from specific checkpoint
 
-echo "=========================================="
-echo "Stage 2: MoE Expert Specialization Training"
-echo "=========================================="
+set -eu
+(set -o pipefail 2>/dev/null) && set -o pipefail || true
+
+echo "Stage 2: MoE Expert Specialization"
 echo ""
 
-# Parse command line arguments
-STAGE1_CHECKPOINT=""
-if [ -n "$1" ]; then
-    STAGE1_CHECKPOINT="$1"
-else
-    # Auto-detect latest checkpoint from stage 1
-    STAGE1_OUTPUT="outputs/llama-3b-moe-mixed-sft"
-    LATEST_CHECKPOINT=$(ls -d $STAGE1_OUTPUT/checkpoint-* 2>/dev/null | sort -V | tail -1)
-    if [ -n "$LATEST_CHECKPOINT" ]; then
-        STAGE1_CHECKPOINT="$LATEST_CHECKPOINT"
-        echo "📂 Auto-detected latest Stage 1 checkpoint:"
-        echo "   $STAGE1_CHECKPOINT"
-    else
-        echo "❌ No Stage 1 checkpoint found in $STAGE1_OUTPUT"
-        echo ""
-        echo "Usage:"
-        echo "  bash scripts/run_moe_stage2.sh [checkpoint_path]"
-        echo ""
-        echo "Example:"
-        echo "  bash scripts/run_moe_stage2.sh outputs/llama-3b-moe-mixed-sft/checkpoint-4500"
-        exit 1
-    fi
-fi
-
-# Check if checkpoint exists
-if [ ! -d "$STAGE1_CHECKPOINT" ]; then
-    echo "❌ Checkpoint not found: $STAGE1_CHECKPOINT"
-    exit 1
-fi
-
-# GPU Configuration
-GPU_IDS="4,5,6,7"  # 🔧 Modify based on available GPUs
-NUM_GPUS=4
+GPU_IDS="${GPU_IDS:-4,5,6,7}"
+NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
 
 export OMP_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 export TRANSFORMERS_VERBOSITY=warning
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Model Configuration
-MODEL_PATH="$STAGE1_CHECKPOINT"
-DATA_CONFIG="configs/data_task_grouped.yaml"
-OUTPUT_DIR="outputs/llama-3b-moe-stage3"
-RUN_NAME="moe-stage3"
+MODEL_PATH="${MODEL_PATH:-outputs/llama-3b-moe-stage1/checkpoint-1800}"
+ADAPTER_PATH="${ADAPTER_PATH:-}"
+DATA_CONFIG="${DATA_CONFIG:-configs/data_task_stage2A.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/llama-3b-moe-stage2}"
+RUN_NAME="${RUN_NAME:-moe-stage2}"
 
-# Stage 2 Hyperparameters
-MAX_STEPS=1500        # 5 tasks × 300 steps × 2 cycles
-BATCH_SIZE=13         # Training batch size
-GRAD_ACCUM=2          # Same as stage 1
-LEARNING_RATE=3e-6    # Lower than stage 1 (8e-6)
-WARMUP_RATIO=0.15     # Longer than stage 1 (0.1)
-AUX_LOSS_ALPHA=0.01   # 10x higher than stage 1 (0.001)
-SAVE_STEPS=100        # Save at end of each task
-EVAL_STEPS=300        # Evaluate at end of each task
-GRADIENT_CKPT="True"
+MAX_STEPS=${MAX_STEPS:-1600}
+STEPS_PER_TASK=${STEPS_PER_TASK:-200}
+BATCH_SIZE=${BATCH_SIZE:-15}
+EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-8}
+GRAD_ACCUM=${GRAD_ACCUM:-2}
+LEARNING_RATE=${LEARNING_RATE:-2e-7}
+WARMUP_RATIO=${WARMUP_RATIO:-0.05}
+AUX_LOSS_ALPHA=${AUX_LOSS_ALPHA:-0.05}
+SAVE_STEPS=${SAVE_STEPS:-400}
+EVAL_STEPS=${EVAL_STEPS:-50}
+EVAL_LOSS_ONLY=${EVAL_LOSS_ONLY:-True}
+FREEZE_NON_MOE=${FREEZE_NON_MOE:-True}
+GRADIENT_CKPT=${GRADIENT_CKPT:-True}
+TENSOR_PARALLEL=${TENSOR_PARALLEL:-1}
 
-echo ""
-echo "📋 Stage 2 Configuration:"
-echo "   Model: $MODEL_PATH"
-echo "   Data config: $DATA_CONFIG"
-echo "   Output: $OUTPUT_DIR"
-echo "   GPUs: $GPU_IDS"
-echo "   Max steps: $MAX_STEPS (5 tasks × 300 steps × 2 cycles)"
-echo ""
-
-
-# Confirm before starting
-printf "Continue with Stage 2 training? (y/n) "
-read -r REPLY
-if [ "$REPLY" != "y" ] && [ "$REPLY" != "Y" ]; then
-    echo "Cancelled."
-    exit 1
+RESUME_FROM_CHECKPOINT=""
+if [ -n "${RESUME:-}" ]; then
+    RESUME_FROM_CHECKPOINT="$RESUME"
+    [ ! -d "$RESUME_FROM_CHECKPOINT" ] && { echo "❌ Checkpoint not found: $RESUME_FROM_CHECKPOINT"; exit 1; }
 fi
 
-echo ""
-echo "🚀 Starting Stage 2 training..."
+echo "📋 Config: Model=$MODEL_PATH | Output=$OUTPUT_DIR | GPUs=$GPU_IDS"
+[ -n "$ADAPTER_PATH" ] && echo "   Adapter: $ADAPTER_PATH"
+echo "   LR=$LEARNING_RATE | Warmup=$WARMUP_RATIO | Steps=$MAX_STEPS"
+[ -n "$RESUME_FROM_CHECKPOINT" ] && echo "   Resume: $RESUME_FROM_CHECKPOINT"
+if [ "$TENSOR_PARALLEL" -gt 1 ]; then
+    [ $((NUM_GPUS % TENSOR_PARALLEL)) -ne 0 ] && { echo "❌ Error: TP ($TENSOR_PARALLEL) must divide GPUs ($NUM_GPUS)"; exit 1; }
+    echo "   Tensor Parallelism: TP=$TENSOR_PARALLEL, DP=$((NUM_GPUS / TENSOR_PARALLEL))"
+fi
 echo ""
 
-# Run training
+read -p "Continue with Stage 2 training? (y/n) " -r REPLY
+[[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Cancelled."; exit 0; }
+
+RESUME_ARG=""
+[ -n "$RESUME_FROM_CHECKPOINT" ] && RESUME_ARG="--resume_from_checkpoint $RESUME_FROM_CHECKPOINT"
+
+ADAPTER_ARG=""
+[ -n "$ADAPTER_PATH" ] && ADAPTER_ARG="--adapter_path $ADAPTER_PATH"
+
+echo "🚀 Starting training..."
+echo ""
+
 deepspeed --include localhost:$GPU_IDS \
     scripts/train_moe_stage2.py \
     --deepspeed distributed-training/zero2.json \
-    --model_name_or_path $MODEL_PATH \
-    --data_config $DATA_CONFIG \
-    --output_dir $OUTPUT_DIR \
-    --run_name $RUN_NAME \
+    --model_name_or_path "$MODEL_PATH" \
+    $ADAPTER_ARG \
+    --data_config "$DATA_CONFIG" \
+    --steps_per_task $STEPS_PER_TASK \
+    --intra_group_shuffle True \
+    --eval_loss_only $EVAL_LOSS_ONLY \
+    --output_dir "$OUTPUT_DIR" \
+    --run_name "$RUN_NAME" \
+    $RESUME_ARG \
     --bf16 True \
     --use_qlora True \
     --lora_r 64 \
-    --lora_alpha 16 \
+    --lora_alpha 32 \
     --lora_dropout 0.05 \
     --aux_loss_alpha $AUX_LOSS_ALPHA \
-    --max_steps $MAX_STEPS \
+    ${AUX_LOSS_INITIAL:+--aux_loss_initial $AUX_LOSS_INITIAL} \
+    ${AUX_LOSS_WARMUP:+--aux_loss_warmup_steps $AUX_LOSS_WARMUP} \
+    ${AUX_LOSS_DECAY_STEPS:+--aux_loss_decay_steps $AUX_LOSS_DECAY_STEPS} \
+    --pretraining_tp $TENSOR_PARALLEL \
     --per_device_train_batch_size $BATCH_SIZE \
+    --per_device_eval_batch_size $EVAL_BATCH_SIZE \
     --gradient_accumulation_steps $GRAD_ACCUM \
     --learning_rate $LEARNING_RATE \
     --lr_scheduler_type cosine \
     --warmup_ratio $WARMUP_RATIO \
-    --logging_steps 30 \
+    --max_steps $MAX_STEPS \
+    --logging_steps 40 \
     --log_level warning \
     --disable_tqdm False \
     --report_to wandb \
@@ -126,25 +110,11 @@ deepspeed --include localhost:$GPU_IDS \
     --dataloader_pin_memory True \
     --dataloader_persistent_workers True \
     --ddp_find_unused_parameters False \
-    --ddp_bucket_cap_mb 25
+    --ddp_bucket_cap_mb 25 \
+    --freeze_non_moe_lora $FREEZE_NON_MOE
 
 TRAINING_EXIT_CODE=$?
 
-echo ""
-echo "=========================================="
-if [ $TRAINING_EXIT_CODE -eq 0 ]; then
-    echo "✅ Stage 2 Training Complete!"
-    echo "=========================================="
-    echo ""
-    echo "Model saved to: $OUTPUT_DIR"
-    echo ""
-else
-    echo "❌ Stage 2 Training Failed!"
-    echo "=========================================="
-    echo ""
-    echo "Exit code: $TRAINING_EXIT_CODE"
-    echo "Please check the error messages above for details."
-    echo ""
-    exit $TRAINING_EXIT_CODE
-fi
+[ $TRAINING_EXIT_CODE -eq 0 ] && echo "✅ Training complete: $OUTPUT_DIR" || echo "❌ Training failed (exit: $TRAINING_EXIT_CODE)"
 
+exit $TRAINING_EXIT_CODE

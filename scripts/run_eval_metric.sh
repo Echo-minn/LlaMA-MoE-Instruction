@@ -5,6 +5,8 @@
 #
 # Usage:
 #   bash scripts/run_eval_stage2A.sh outputs/llama-3b-moe-stage2A/checkpoint-3000
+#   bash scripts/run_eval_stage2A.sh outputs/llama-3b-moe-stage2A/checkpoint-3000 --task first
+#   bash scripts/run_eval_stage2A.sh outputs/llama-3b-moe-stage2A/checkpoint-3000 --task math --show_samples
 #   bash scripts/run_eval_stage2A.sh outputs/llama-3b-moe-stage2A/checkpoint-3000 --max_samples_per_task 100
 
 set -euo pipefail
@@ -50,7 +52,11 @@ export TRANSFORMERS_VERBOSITY=warning
 # Evaluation config
 DATA_CONFIG="configs/data_task_stage2A.yaml"
 MAX_SAMPLES_PER_TASK="${MAX_SAMPLES_PER_TASK:-}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-18}"
+
+# Collect all remaining arguments (everything after MODEL_PATH)
+shift  # Remove MODEL_PATH from arguments
+EXTRA_ARGS=("$@")
 
 echo ""
 echo "📋 Evaluation Configuration:"
@@ -63,16 +69,23 @@ if [ -n "$MAX_SAMPLES_PER_TASK" ]; then
 else
     echo "   Max samples:  All available"
 fi
+if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+    echo "   Extra args:   ${EXTRA_ARGS[*]}"
+fi
 echo ""
 
 # Build command
-CMD="python scripts/evaluate_stage2A.py"
+CMD="python scripts/evaluate_metric.py"
 CMD="$CMD --model_path \"$MODEL_PATH\""
 CMD="$CMD --data_config \"$DATA_CONFIG\""
 CMD="$CMD --batch_size $BATCH_SIZE"
 if [ -n "$MAX_SAMPLES_PER_TASK" ]; then
     CMD="$CMD --max_samples_per_task $MAX_SAMPLES_PER_TASK"
 fi
+# Add any extra arguments (pass them through to Python script)
+for arg in "${EXTRA_ARGS[@]}"; do
+    CMD="$CMD \"$arg\""
+done
 
 echo "🚀 Running evaluation..."
 echo ""

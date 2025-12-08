@@ -18,5 +18,17 @@ bash scripts/convert_llama3b_to_moe.sh
 
 ## Train the model
 ```bash
-bash scripts/run_mixed_sft.sh
+bash scripts/run_moe_stage1.sh
+bash scripts/run_moe_stage2.sh
+bash scripts/run_moe_stage3.sh
+```
+
+5. Evaluate the model
+```bash
+bash scripts/run_eval_metric.sh
+```
+
+6. Run routing sanity check
+```bash
+python scripts/check_routing_sanity.py
 ```

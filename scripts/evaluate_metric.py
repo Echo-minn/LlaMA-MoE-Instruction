@@ -49,7 +49,31 @@ DEFAULT_PROMPT_TEMPLATE = """### Instruction:
 {instruction}
 
 ### Response:
-"""
+{response}"""
+
+TASK_PROMPT_TEMPLATES = {
+    "math": """### Question:
+{instruction}
+
+### Answer:
+{response}""",
+    "code": """Below is an instruction that describes a task. Write a response that appropriately completes the request.
+### Instruction:
+{instruction}
+
+### Output:
+{response}""",
+    "summarization": """### Article:
+{instruction}
+
+### Highlights Summary:
+{response}""",
+    "translation": """### en:
+{instruction}
+
+### zh:
+{response}""",
+}
 
 DATASET_OVERRIDES: Dict[str, Dict[str, str]] = {
     "gsm8k": {"config": "main", "format": "gsm8k", "task_type": "math"},
@@ -76,32 +100,40 @@ def load_data_config(config_path: str) -> Dict:
         return yaml.safe_load(f)
 
 
-def format_alpaca(example: Dict) -> Dict:
+def slugify_task(name: str) -> str:
+    return name.lower().replace(" ", "_").replace("-", "_").replace("/", "_").replace(".", "_")
+
+
+def format_alpaca(example: Dict, task_type: str, task_templates: Dict[str, str]) -> Dict:
     instruction = example.get("instruction", "")
     input_text = example.get("input", "")
     output = example.get("output", "") or example.get("response", "")
     if input_text:
         instruction = f"{instruction}\n\nInput: {input_text}"
-    return {"instruction": instruction, "response": output}
+    template = task_templates.get(task_type, DEFAULT_PROMPT_TEMPLATE)
+    return {"text": template.format(instruction=instruction, response=""), "response": output}
 
 
-def format_gsm8k(example: Dict) -> Dict:
-    return {"instruction": example.get("question", ""), "response": example.get("answer", "")}
+def format_gsm8k(example: Dict, task_type: str, task_templates: Dict[str, str]) -> Dict:
+    question = example.get("question", "")
+    answer = example.get("answer", "")
+    template = task_templates.get(task_type, DEFAULT_PROMPT_TEMPLATE)
+    return {"text": template.format(instruction=question, response=""), "response": answer}
 
 
-def format_cnn_dailymail(example: Dict) -> Dict:
+def format_cnn_dailymail(example: Dict, task_type: str, task_templates: Dict[str, str]) -> Dict:
     article = example.get("article", "")
     highlights = example.get("highlights", "")
-    instruction = "Summarize the following article:\n\n" + article
-    return {"instruction": instruction, "response": highlights}
+    template = task_templates.get(task_type, DEFAULT_PROMPT_TEMPLATE)
+    return {"text": template.format(instruction=article, response=""), "response": highlights}
 
 
-def format_translation(example: Dict, source_lang: str, target_lang: str) -> Dict:
+def format_translation(example: Dict, source_lang: str, target_lang: str, task_type: str, task_templates: Dict[str, str]) -> Dict:
     translation = example.get("translation", {})
     src = translation.get(source_lang, "")
     tgt = translation.get(target_lang, "")
-    instruction = f"Translate the following {source_lang.upper()} text to {target_lang.upper()}:\n\n{src}"
-    return {"instruction": instruction, "response": tgt}
+    template = task_templates.get(task_type, DEFAULT_PROMPT_TEMPLATE)
+    return {"text": template.format(instruction=src, response=""), "response": tgt}
 
 
 FORMATTER_REGISTRY: Dict[str, Callable] = {
@@ -116,24 +148,30 @@ def apply_dataset_defaults(dataset_cfg: Dict) -> Dict:
     overrides = DATASET_OVERRIDES.get(dataset_cfg["name"], {})
     merged.update(overrides)
     merged.update(dataset_cfg)
+    if "task_type" not in merged:
+        merged["task_type"] = slugify_task(dataset_cfg["name"])
     if "format" not in merged:
         merged["format"] = "alpaca"
     return merged
 
 
-def resolve_formatter(dataset_cfg: Dict) -> Callable:
+def resolve_formatter(dataset_cfg: Dict, task_templates: Dict[str, str]) -> Callable:
     fmt = dataset_cfg.get("format", "alpaca")
+    task_type = dataset_cfg.get("task_type", "alpaca")
     if fmt == "translation":
         source_lang = dataset_cfg.get("source_lang", "zh")
         target_lang = dataset_cfg.get("target_lang", "en")
-        return partial(format_translation, source_lang=source_lang, target_lang=target_lang)
-    return FORMATTER_REGISTRY.get(fmt, format_alpaca)
+        return partial(format_translation, source_lang=source_lang, target_lang=target_lang, task_type=task_type, task_templates=task_templates)
+    formatter = FORMATTER_REGISTRY.get(fmt, format_alpaca)
+    if fmt not in FORMATTER_REGISTRY:
+        logger.warning(f"No formatter registered for '{fmt}', defaulting to Alpaca-style.")
+    return partial(formatter, task_type=task_type, task_templates=task_templates)
 
 
-def load_eval_dataset(dataset_cfg: Dict, max_samples: Optional[int] = None) -> Dataset:
+def load_eval_dataset(dataset_cfg: Dict, task_templates: Dict[str, str], max_samples: Optional[int] = None) -> Dataset:
     """Load evaluation dataset for a task."""
     merged_cfg = apply_dataset_defaults(dataset_cfg)
-    formatter = resolve_formatter(merged_cfg)
+    formatter = resolve_formatter(merged_cfg, task_templates)
     
     vali_split = merged_cfg.get("vali_split")
     validation_samples = merged_cfg.get("validation_samples")
@@ -160,7 +198,7 @@ def load_eval_dataset(dataset_cfg: Dict, max_samples: Optional[int] = None) -> D
             remove_columns=ds.column_names,
             desc=f"Formatting {name}:{vali_split}",
         )
-        ds = ds.filter(lambda x: len(x["instruction"]) > 0 and len(x["response"]) > 0)
+        ds = ds.filter(lambda x: len(x.get("text", "")) > 0 and len(x.get("response", "")) > 0)
         return ds
     except Exception as exc:
         logger.error(f"Failed to load {name} ({vali_split}): {exc}")
@@ -212,6 +250,9 @@ def compute_gsm8k_em(predictions: List[str], references: List[str]) -> float:
     for idx, (pred, ref) in enumerate(zip(predictions, references)):
         pred_answer = extract_gsm8k_answer(pred)
         ref_answer = extract_gsm8k_answer(ref)
+
+        print(f"Pred Answer: {pred_answer}, Ref Answer: {ref_answer}")
+        print("-" * 80)
         
         if not pred_answer or not ref_answer:
             failed_extractions += 1
@@ -284,36 +325,32 @@ def compute_code_pass_at_1(predictions: List[str], references: List[str]) -> flo
 def generate_predictions(
     model,
     tokenizer,
-    instructions: List[str],
-    prompt_template: str,
-    task_type: str = None,
+    texts: List[str],
     max_new_tokens: int = 256,
     batch_size: int = 4,
     device: str = "cuda",
+    do_sample: bool = True,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
 ) -> List[str]:
-    """Generate predictions for a batch of instructions."""
+    """Generate predictions for a batch of formatted prompts."""
     all_predictions = []
-    
-    # Add task prefix if task_type is provided
-    task_prefix = f"<|task_{task_type}|> " if task_type else ""
 
-    num_samples = len(instructions)
+    num_samples = len(texts)
     num_batches = (num_samples + batch_size - 1) // batch_size
 
     logger.info(f"Generating in {num_batches} batches (batch_size={batch_size})")
+    if do_sample:
+        logger.info(f"  Using sampling: temperature={temperature}, top_p={top_p}")
+    else:
+        logger.info(f"  Using greedy decoding (deterministic)")
 
     for i in tqdm(range(0, num_samples, batch_size), total=num_batches, desc="Generation", leave=False):
-        batch_instructions = instructions[i : i + batch_size]
-        
-        # Format prompts with task prefix
-        prompts = [
-            prompt_template.format(instruction=f"{task_prefix}{inst}")
-            for inst in batch_instructions
-        ]
+        batch_texts = texts[i : i + batch_size]
         
         # Tokenize
         inputs = tokenizer(
-            prompts,
+            batch_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -322,15 +359,24 @@ def generate_predictions(
         
         # Generate
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=None,
-                top_p=None,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
+            if do_sample:
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            else:
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
         
         # Decode only the generated part
         input_lengths = inputs["input_ids"].shape[1]
@@ -342,15 +388,28 @@ def generate_predictions(
     return all_predictions
 
 
+def truncate_text(text: str, max_len: int = 150) -> str:
+    """Truncate text to max_len, adding ellipsis if truncated."""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "..."
+
+def extract_answer(text: str) -> str:
+    """Extract the answer from the text."""
+    return text.split("#### ")[1].strip()
+
 def evaluate_task(
     model,
     tokenizer,
     dataset: Dataset,
     task_type: str,
-    prompt_template: str,
     max_samples: Optional[int] = None,
     batch_size: int = 6,
     device: str = "cuda",
+    show_samples: bool = False,
+    do_sample: bool = True,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
 ) -> Dict[str, float]:
     """Evaluate model on a specific task."""
     logger.info(f"\n{'='*80}")
@@ -365,7 +424,7 @@ def evaluate_task(
     
     logger.info(f"Evaluating on {len(eval_dataset)} samples")
     
-    instructions = eval_dataset["instruction"]
+    texts = eval_dataset["text"]
     references = eval_dataset["response"]
     
     # Generate predictions
@@ -373,13 +432,24 @@ def evaluate_task(
     predictions = generate_predictions(
         model,
         tokenizer,
-        instructions,
-        prompt_template,
-        task_type=task_type,
+        texts,
         max_new_tokens=512,
         batch_size=batch_size,
         device=device,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
     )
+    
+    # Print samples if requested
+    if show_samples:
+        logger.info("\n" + "-" * 80)
+        logger.info("SAMPLE OUTPUTS:")
+        logger.info("-" * 80)
+        for idx, (text, pred, ref) in enumerate(zip(texts, predictions, references)):
+            logger.info(f"\n[Sample {idx + 1}]")
+            logger.info(f"prediction: {truncate_text(pred, )}")
+        logger.info("-" * 80 + "\n")
     
     # Compute task-specific metrics
     metrics = {}
@@ -403,9 +473,18 @@ def evaluate_task(
             predictions=predictions,
             references=references,
         )
-        metrics["rouge1"] = rouge_scores["rouge1"].precision
-        metrics["rouge2"] = rouge_scores["rouge2"].precision
-        metrics["rougeL"] = rouge_scores["rougeL"].precision
+        # Handle both Score objects (with .precision attribute) and direct float values
+        def get_rouge_value(score):
+            if hasattr(score, 'precision'):
+                # Score object with precision, recall, fmeasure attributes
+                return float(score.precision)
+            else:
+                # Already a float/number
+                return float(score)
+        
+        metrics["rouge1"] = get_rouge_value(rouge_scores["rouge1"])
+        metrics["rouge2"] = get_rouge_value(rouge_scores["rouge2"])
+        metrics["rougeL"] = get_rouge_value(rouge_scores["rougeL"])
         logger.info(f"ROUGE-1: {metrics['rouge1']:.4f}")
         logger.info(f"ROUGE-2: {metrics['rouge2']:.4f}")
         logger.info(f"ROUGE-L: {metrics['rougeL']:.4f}")
@@ -451,7 +530,7 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
+        default=18,
         help="Batch size for generation",
     )
     parser.add_argument(
@@ -459,6 +538,41 @@ def main():
         type=str,
         default="cuda",
         help="Device to use (cuda/cpu)",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="Evaluate only a specific task (task_type like 'math', 'code', etc.) or 'first' for first enabled task. None = evaluate all tasks.",
+    )
+    parser.add_argument(
+        "--show_samples",
+        action="store_true",
+        help="Print prompt and output for each sample (concise format)",
+    )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        default=True,
+        help="Use sampling for generation (default: True). Use --no-do_sample for greedy decoding.",
+    )
+    parser.add_argument(
+        "--no-do_sample",
+        dest="do_sample",
+        action="store_false",
+        help="Use greedy decoding instead of sampling",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Temperature for sampling (default: 0.7). Higher = more random.",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.9,
+        help="Top-p (nucleus) sampling parameter (default: 0.9).",
     )
     
     args = parser.parse_args()
@@ -476,12 +590,10 @@ def main():
     # Load data config
     data_config = load_data_config(args.data_config)
     processing_cfg = data_config.get("processing", {})
-    prompt_template = processing_cfg.get("prompt_template", DEFAULT_PROMPT_TEMPLATE)
-    # Extract just the instruction part (before ### Response:)
-    if "### Response:" in prompt_template:
-        prompt_template = prompt_template.split("### Response:")[0] + "### Response:\n"
-    else:
-        prompt_template = DEFAULT_PROMPT_TEMPLATE
+    
+    # Load task-specific templates (allow override from config)
+    task_templates = processing_cfg.get("task_prompt_templates", {})
+    task_templates = {**TASK_PROMPT_TEMPLATES, **task_templates}
     
     # Load tokenizer first to get the correct vocabulary size
     logger.info(f"Loading tokenizer from {args.model_path}")
@@ -614,6 +726,31 @@ def main():
     all_metrics = {}
     datasets_cfg = data_config.get("datasets", [])
     
+    # Filter tasks if --task is specified
+    if args.task:
+        if args.task.lower() == "first":
+            # Find first enabled task
+            first_enabled = None
+            for dataset_cfg in datasets_cfg:
+                if dataset_cfg.get("enabled", False):
+                    merged_cfg = apply_dataset_defaults(dataset_cfg)
+                    first_enabled = merged_cfg["task_type"]
+                    logger.info(f"Evaluating only first enabled task: {first_enabled}")
+                    break
+            if first_enabled:
+                datasets_cfg = [cfg for cfg in datasets_cfg if apply_dataset_defaults(cfg).get("task_type") == first_enabled]
+            else:
+                logger.warning("No enabled tasks found!")
+                return
+        else:
+            # Filter to specific task type
+            datasets_cfg = [cfg for cfg in datasets_cfg if apply_dataset_defaults(cfg).get("task_type") == args.task]
+            if not datasets_cfg:
+                logger.warning(f"No tasks found matching task_type: {args.task}")
+                logger.info(f"Available task types: {[apply_dataset_defaults(cfg).get('task_type') for cfg in data_config.get('datasets', []) if cfg.get('enabled', False)]}")
+                return
+            logger.info(f"Evaluating only task: {args.task}")
+    
     for dataset_cfg in datasets_cfg:
         if not dataset_cfg.get("enabled", False):
             continue
@@ -622,7 +759,7 @@ def main():
         task_type = merged_cfg["task_type"]
         
         # Load eval dataset
-        eval_dataset = load_eval_dataset(merged_cfg, max_samples=args.max_samples_per_task)
+        eval_dataset = load_eval_dataset(merged_cfg, task_templates, max_samples=args.max_samples_per_task)
         if eval_dataset is None or len(eval_dataset) == 0:
             logger.warning(f"Skipping {task_type}: no eval dataset available")
             continue
@@ -633,10 +770,13 @@ def main():
             tokenizer,
             eval_dataset,
             task_type,
-            prompt_template,
             max_samples=args.max_samples_per_task,
             batch_size=args.batch_size,
             device=args.device,
+            show_samples=args.show_samples,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
         )
         
         all_metrics[task_type] = task_metrics

@@ -1,12 +1,10 @@
 #!/bin/bash
-
-# Stage 1: All shuffled training for routing separation (Math, Code, Summ, Translation)
+# Stage 3: Update all adapters and router weights for overall performance
 
 set -eu
-# Use pipefail only if bash supports it (bash 3.0+)
 (set -o pipefail 2>/dev/null) && set -o pipefail || true
 
-echo "Stage 1: MoE Routing Separation"
+echo "Stage 3: Update all adapters and router weights for overall performance"
 echo ""
 
 GPU_IDS="${GPU_IDS:-4,5,6,7}"
@@ -18,88 +16,63 @@ export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 export TRANSFORMERS_VERBOSITY=warning
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Stage 1 config
-MODEL_PATH="models/Llama-3.2-3B-Instruct-MoE-8x"
+MODEL_PATH="${MODEL_PATH:-outputs/llama-3b-moe-stage2/checkpoint-800}"
 ADAPTER_PATH="${ADAPTER_PATH:-}"
-DATA_CONFIG="configs/data_task_stage2A.yaml"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/llama-3b-moe-stage1}"
-RUN_NAME="${RUN_NAME:-moe-stage1}"
+DATA_CONFIG="${DATA_CONFIG:-configs/data_task_stage2A.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/llama-3b-moe-stage3}"
+RUN_NAME="${RUN_NAME:-moe-stage3}"
 
-MAX_STEPS=${MAX_STEPS:-2400}      # 4 tasks × 300 steps × 2 cycles + buffer
-STEPS_PER_TASK=${STEPS_PER_TASK:-300}
+MAX_STEPS=${MAX_STEPS:-1600}
+STEPS_PER_TASK=${STEPS_PER_TASK:-200}
 BATCH_SIZE=${BATCH_SIZE:-15}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-8}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
-LEARNING_RATE=${LEARNING_RATE:-2e-4}
-WARMUP_RATIO=${WARMUP_RATIO:-0.10}
-AUX_LOSS_ALPHA=${AUX_LOSS_ALPHA:-0.08}
-AUX_LOSS_INITIAL=${AUX_LOSS_INITIAL:-0.12}
-AUX_LOSS_WARMUP=${AUX_LOSS_WARMUP:-400}
-AUX_LOSS_DECAY_STEPS=${AUX_LOSS_DECAY_STEPS:-}
-SAVE_STEPS=${SAVE_STEPS:-100}
-EVAL_STEPS=${EVAL_STEPS:-50}
+LEARNING_RATE=${LEARNING_RATE:-1e-5}
+WARMUP_RATIO=${WARMUP_RATIO:-0.05}
+AUX_LOSS_ALPHA=${AUX_LOSS_ALPHA:-0.05}
+SAVE_STEPS=${SAVE_STEPS:-200}
+EVAL_STEPS=${EVAL_STEPS:-40}
 EVAL_LOSS_ONLY=${EVAL_LOSS_ONLY:-True}
-FREEZE_NON_MOE=${FREEZE_NON_MOE:-True}
+FREEZE_NON_MOE=${FREEZE_NON_MOE:-False}
 GRADIENT_CKPT=${GRADIENT_CKPT:-True}
 TENSOR_PARALLEL=${TENSOR_PARALLEL:-1}
 
-# Resume from checkpoint (only if explicitly specified)
 RESUME_FROM_CHECKPOINT=""
 if [ -n "${RESUME:-}" ]; then
     RESUME_FROM_CHECKPOINT="$RESUME"
-    if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
-        echo "❌ Checkpoint not found: $RESUME_FROM_CHECKPOINT"
-        exit 1
-    fi
+    [ ! -d "$RESUME_FROM_CHECKPOINT" ] && { echo "❌ Checkpoint not found: $RESUME_FROM_CHECKPOINT"; exit 1; }
 fi
 
 echo "📋 Config: Model=$MODEL_PATH | Output=$OUTPUT_DIR | GPUs=$GPU_IDS"
-if [ -n "$ADAPTER_PATH" ]; then
-    echo "   Adapter: $ADAPTER_PATH (reusing existing adapters)"
-fi
+[ -n "$ADAPTER_PATH" ] && echo "   Adapter: $ADAPTER_PATH"
 echo "   LR=$LEARNING_RATE | Warmup=$WARMUP_RATIO | Steps=$MAX_STEPS"
-if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
-    echo "   Resume: $RESUME_FROM_CHECKPOINT (LR→$LEARNING_RATE)"
-fi
+[ -n "$RESUME_FROM_CHECKPOINT" ] && echo "   Resume: $RESUME_FROM_CHECKPOINT"
 if [ "$TENSOR_PARALLEL" -gt 1 ]; then
-    if [ $((NUM_GPUS % TENSOR_PARALLEL)) -ne 0 ]; then
-        echo "❌ Error: Tensor parallelism degree ($TENSOR_PARALLEL) must divide number of GPUs ($NUM_GPUS)"
-        exit 1
-    fi
-    DATA_PARALLEL=$((NUM_GPUS / TENSOR_PARALLEL))
-    echo "   Tensor Parallelism: TP=$TENSOR_PARALLEL, DP=$DATA_PARALLEL (Total GPUs: $NUM_GPUS)"
+    [ $((NUM_GPUS % TENSOR_PARALLEL)) -ne 0 ] && { echo "❌ Error: TP ($TENSOR_PARALLEL) must divide GPUs ($NUM_GPUS)"; exit 1; }
+    echo "   Tensor Parallelism: TP=$TENSOR_PARALLEL, DP=$((NUM_GPUS / TENSOR_PARALLEL))"
 fi
 echo ""
 
-printf "Continue with Stage 1 training? (y/n) "
-read -r REPLY
-if [ "$REPLY" != "y" ] && [ "$REPLY" != "Y" ]; then
-    echo "Cancelled."
-    exit 0
-fi
+read -p "Continue with Stage 3 training? (y/n) " -r REPLY
+[[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Cancelled."; exit 0; }
 
-# Build resume argument if checkpoint is specified
 RESUME_ARG=""
-if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
-    RESUME_ARG="--resume_from_checkpoint $RESUME_FROM_CHECKPOINT"
-fi
+[ -n "$RESUME_FROM_CHECKPOINT" ] && RESUME_ARG="--resume_from_checkpoint $RESUME_FROM_CHECKPOINT"
+
+ADAPTER_ARG=""
+[ -n "$ADAPTER_PATH" ] && ADAPTER_ARG="--adapter_path $ADAPTER_PATH"
 
 echo "🚀 Starting training..."
 echo ""
 
-# Build adapter argument if specified
-ADAPTER_ARG=""
-if [ -n "$ADAPTER_PATH" ]; then
-    ADAPTER_ARG="--adapter_path $ADAPTER_PATH"
-fi
-
 deepspeed --include localhost:$GPU_IDS \
-    scripts/train_moe_stage1.py \
+    scripts/train_moe_stage3.py \
     --deepspeed distributed-training/zero2.json \
     --model_name_or_path "$MODEL_PATH" \
     $ADAPTER_ARG \
     --data_config "$DATA_CONFIG" \
     --steps_per_task $STEPS_PER_TASK \
+    --intra_group_shuffle True \
     --shuffle_tasks True \
     --eval_loss_only $EVAL_LOSS_ONLY \
     --output_dir "$OUTPUT_DIR" \
@@ -122,7 +95,7 @@ deepspeed --include localhost:$GPU_IDS \
     --lr_scheduler_type cosine \
     --warmup_ratio $WARMUP_RATIO \
     --max_steps $MAX_STEPS \
-    --logging_steps 25 \
+    --logging_steps 20 \
     --log_level warning \
     --disable_tqdm False \
     --report_to wandb \
@@ -143,11 +116,6 @@ deepspeed --include localhost:$GPU_IDS \
 
 TRAINING_EXIT_CODE=$?
 
-if [ $TRAINING_EXIT_CODE -eq 0 ]; then
-    echo "✅ Training complete: $OUTPUT_DIR"
-else
-    echo "❌ Training failed (exit: $TRAINING_EXIT_CODE)"
-fi
+[ $TRAINING_EXIT_CODE -eq 0 ] && echo "✅ Training complete: $OUTPUT_DIR" || echo "❌ Training failed (exit: $TRAINING_EXIT_CODE)"
 
 exit $TRAINING_EXIT_CODE
-
